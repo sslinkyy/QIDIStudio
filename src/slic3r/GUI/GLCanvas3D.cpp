@@ -1402,7 +1402,11 @@ GLCanvas3D::ArrangeSettings& GLCanvas3D::get_arrange_settings()
         ptr->postfix = "_sla";
     }
     else if (ptech == ptFFF) {
-        if (wxGetApp().global_print_sequence() == PrintSequence::ByObject) {
+        PartPlate* current_plate = wxGetApp().plater() != nullptr
+            ? wxGetApp().plater()->get_partplate_list().get_curr_plate() : nullptr;
+        const PrintSequence print_sequence = current_plate != nullptr
+            ? current_plate->get_real_print_seq() : wxGetApp().global_print_sequence();
+        if (print_sequence == PrintSequence::ByObject) {
             ptr     = &m_arrange_settings_fff_seq_print;
             ptr->postfix = "_fff_seq_print";
         } else {
