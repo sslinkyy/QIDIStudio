@@ -1118,6 +1118,107 @@ json config_snapshot(const DynamicPrintConfig& config, const std::vector<std::st
     return values;
 }
 
+const char* config_option_type_name(ConfigOptionType type)
+{
+    switch (type) {
+    case coFloat:            return "float";
+    case coFloats:           return "float_array";
+    case coInt:              return "integer";
+    case coInts:             return "integer_array";
+    case coString:           return "string";
+    case coStrings:          return "string_array";
+    case coPercent:          return "percent";
+    case coPercents:         return "percent_array";
+    case coFloatOrPercent:   return "float_or_percent";
+    case coFloatsOrPercents: return "float_or_percent_array";
+    case coPoint:            return "point";
+    case coPoints:           return "point_array";
+    case coPoint3:           return "point3";
+    case coBool:             return "boolean";
+    case coBools:            return "boolean_array";
+    case coEnum:             return "enum";
+    case coEnums:            return "enum_array";
+    case coPointsGroups:     return "point_groups";
+    case coIntsGroups:       return "integer_groups";
+    default:                 return "unknown";
+    }
+}
+
+const char* config_option_mode_name(ConfigOptionMode mode)
+{
+    switch (mode) {
+    case comSimple:   return "simple";
+    case comAdvanced: return "advanced";
+    case comDevelop:  return "developer";
+    default:          return "unknown";
+    }
+}
+
+json setting_definition_to_json(const ConfigOptionDef& definition,
+                                const json& supported_scopes,
+                                const ConfigOption* effective,
+                                const ConfigOption* local,
+                                const std::string& value_source)
+{
+    json result = {
+        {"key", definition.opt_key},
+        {"type", config_option_type_name(definition.type)},
+        {"vector", (static_cast<int>(definition.type) & static_cast<int>(coVectorType)) != 0},
+        {"nullable", definition.nullable},
+        {"read_only", definition.readonly},
+        {"mode", config_option_mode_name(definition.mode)},
+        {"label", definition.label},
+        {"full_label", definition.full_label},
+        {"description", definition.tooltip},
+        {"category", definition.category},
+        {"unit", definition.sidetext},
+        {"ratio_over", definition.ratio_over.empty() ? json(nullptr) : json(definition.ratio_over)},
+        {"default_value", definition.default_value ? json(definition.default_value->serialize()) : json(nullptr)},
+        {"supported_scopes", supported_scopes},
+        {"current_value", effective != nullptr ? json(effective->serialize()) : json(nullptr)},
+        {"local_value", local != nullptr ? json(local->serialize()) : json(nullptr)},
+        {"overridden", value_source == "object_override" || value_source == "volume_override"},
+        {"value_source", value_source.empty() ? json(nullptr) : json(value_source)}
+    };
+    if (definition.min != ConfigOptionDef::min_default)
+        result["minimum"] = definition.min;
+    if (definition.max != ConfigOptionDef::max_default)
+        result["maximum"] = definition.max;
+    if (!definition.enum_values.empty()) {
+        json values = json::array();
+        for (size_t index = 0; index < definition.enum_values.size(); ++index) {
+            const std::string label = index < definition.enum_labels.size() && !definition.enum_labels[index].empty()
+                ? definition.enum_labels[index] : definition.enum_values[index];
+            values.push_back({{"value", definition.enum_values[index]}, {"label", label}});
+        }
+        result["enum_values"] = std::move(values);
+    }
+    if (!definition.aliases.empty())
+        result["aliases"] = definition.aliases;
+    return result;
+}
+
+bool setting_text_matches(const ConfigOptionDef& definition, const std::string& query)
+{
+    if (query.empty())
+        return true;
+    const std::string haystack = lower_copy(definition.opt_key + "\n" + definition.label + "\n" +
+        definition.full_label + "\n" + definition.category + "\n" + definition.tooltip);
+    return haystack.find(query) != std::string::npos;
+}
+
+json introduced_validation_errors(const std::map<std::string, std::string>& baseline,
+                                  const std::map<std::string, std::string>& candidate)
+{
+    json result = json::array();
+    for (const auto& [key, message] : candidate) {
+        const auto existing = baseline.find(key);
+        if (existing == baseline.end() || existing->second != message)
+            result.push_back({{"key", key}, {"message", message}});
+    }
+    return result;
+}
+
 double first_numeric_option(const DynamicPrintConfig& config, const std::string& key,
                             double fallback = 0.0)
 {
@@ -2405,6 +2506,378 @@ json reset_volume_settings(const json& args)
                     {"reset", std::move(reset)},
                     {"override_count", volume->config.get().keys().size()},
                     {"undo_available", plater->can_undo()}};
+    });
+}
+
+json list_setting_definitions(const json& args)
+{
+    const std::string scope = args.value("scope", "print");
+    if (scope != "print" && scope != "filament" && scope != "printer" &&
+        scope != "object" && scope != "volume")
+        return {{"error", "scope must be print, filament, printer, object, or volume"}};
+
+    const std::string query = lower_copy(args.value("query", ""));
+    const std::string category = lower_copy(args.value("category", ""));
+    const int offset_value = args.value("offset", 0);
+    const int limit_value = args.value("limit", 100);
+    if (offset_value < 0)
+        return {{"error", "offset must be non-negative"}};
+    if (limit_value < 1 || limit_value > 500)
+        return {{"error", "limit must be between 1 and 500"}};
+
+    int filament_index = -1;
+    int object_id = -1;
+    int volume_id = -1;
+    for (const auto& item : std::array<std::pair<const char*, int*>, 3>{{
+            {"filament_index", &filament_index}, {"object_id", &object_id}, {"volume_id", &volume_id}}}) {
+        if (!args.contains(item.first))
+            continue;
+        if (!args[item.first].is_number_integer() || args[item.first].get<int>() < 0)
+            return {{"error", std::string(item.first) + " must be a non-negative integer"}};
+        *item.second = args[item.first].get<int>();
+    }
+    if (scope != "filament" && filament_index >= 0)
+        return {{"error", "filament_index is only valid for filament scope"}};
+    if (scope != "object" && scope != "volume" && object_id >= 0)
+        return {{"error", "object_id is only valid for object or volume scope"}};
+    if (scope != "volume" && volume_id >= 0)
+        return {{"error", "volume_id is only valid for volume scope"}};
+    if (scope == "volume" && ((object_id >= 0) != (volume_id >= 0)))
+        return {{"error", "object_id and volume_id must be provided together for volume context"}};
+
+    const size_t offset = static_cast<size_t>(offset_value);
+    const size_t limit = static_cast<size_t>(limit_value);
+    return on_gui_thread([scope, query, category, offset, limit,
+                          filament_index, object_id, volume_id]() {
+        PresetBundle* bundle = wxGetApp().preset_bundle;
+        if (bundle == nullptr)
+            throw std::runtime_error("Preset bundle is not available");
+
+        const DynamicPrintConfig* print_config = require_tab(Preset::TYPE_PRINT)->get_config();
+        const DynamicPrintConfig* filament_config = require_tab(Preset::TYPE_FILAMENT)->get_config();
+        const DynamicPrintConfig* printer_config = require_tab(Preset::TYPE_PRINTER)->get_config();
+        auto* model_tab = dynamic_cast<TabPrintModel*>(wxGetApp().get_model_tab());
+        if (model_tab == nullptr)
+            throw std::runtime_error("QIDI object settings tab is not available");
+
+        std::string context_name;
+        if (scope == "filament" && filament_index >= 0) {
+            const size_t index = static_cast<size_t>(filament_index);
+            if (index >= bundle->filament_presets.size())
+                throw std::runtime_error("filament_index is out of range");
+            context_name = bundle->filament_presets[index];
+            const Preset* preset = bundle->filaments.find_preset(context_name, false);
+            if (preset == nullptr)
+                throw std::runtime_error("Assigned filament preset was not found");
+            filament_config = &preset->config;
+        }
+
+        const DynamicPrintConfig* object_config = nullptr;
+        const DynamicPrintConfig* volume_config = nullptr;
+        if (object_id >= 0) {
+            ModelObject* object = require_model_object(require_plater(), object_id);
+            object_config = &object->config.get();
+            if (volume_id >= 0)
+                volume_config = &require_model_volume(object, volume_id)->config.get();
+        }
+
+        json definitions = json::array();
+        size_t matched = 0;
+        for (const auto& [key, definition] : print_config_def.options) {
+            const bool print_supported = print_config->option(key) != nullptr;
+            const bool filament_supported = filament_config->option(key) != nullptr;
+            const bool printer_supported = printer_config->option(key) != nullptr;
+            const bool model_supported = model_tab->has_key(key);
+            const bool in_scope =
+                (scope == "print" && print_supported) ||
+                (scope == "filament" && filament_supported) ||
+                (scope == "printer" && printer_supported) ||
+                (scope == "object" && model_supported) ||
+                (scope == "volume" && model_supported);
+            if (!in_scope || !setting_text_matches(definition, query) ||
+                (!category.empty() && lower_copy(definition.category) != category))
+                continue;
+
+            const size_t match_index = matched++;
+            if (match_index < offset || definitions.size() >= limit)
+                continue;
+
+            json supported_scopes = json::array();
+            if (print_supported) supported_scopes.push_back("print");
+            if (filament_supported) supported_scopes.push_back("filament");
+            if (printer_supported) supported_scopes.push_back("printer");
+            if (model_supported) {
+                supported_scopes.push_back("object");
+                supported_scopes.push_back("volume");
+            }
+
+            const ConfigOption* local = nullptr;
+            const ConfigOption* effective = nullptr;
+            std::string source;
+            if (scope == "print") {
+                local = effective = print_config->option(key);
+                source = "active_print_settings";
+            } else if (scope == "filament") {
+                local = effective = filament_config->option(key);
+                source = filament_index >= 0 ? "project_filament_preset" : "active_filament_settings";
+            } else if (scope == "printer") {
+                local = effective = printer_config->option(key);
+                source = "active_printer_settings";
+            } else if (scope == "object" && object_config != nullptr) {
+                local = object_config->option(key);
+                effective = local != nullptr ? local : print_config->option(key);
+                source = local != nullptr ? "object_override" : "print_preset";
+            } else if (scope == "volume" && volume_config != nullptr) {
+                local = volume_config->option(key);
+                const ConfigOption* object_option = object_config != nullptr ? object_config->option(key) : nullptr;
+                effective = local != nullptr ? local :
+                            (object_option != nullptr ? object_option : print_config->option(key));
+                source = local != nullptr ? "volume_override" :
+                         (object_option != nullptr ? "object_override" : "print_preset");
+            }
+            definitions.push_back(setting_definition_to_json(
+                definition, supported_scopes, effective, local, source));
+        }
+
+        const size_t returned = definitions.size();
+        const size_t next = offset + returned;
+        return json{
+            {"scope", scope},
+            {"query", query},
+            {"category", category.empty() ? json(nullptr) : json(category)},
+            {"offset", offset},
+            {"limit", limit},
+            {"returned", returned},
+            {"total_matching", matched},
+            {"next_offset", next < matched ? json(next) : json(nullptr)},
+            {"context", {
+                {"filament_index", filament_index >= 0 ? json(filament_index) : json(nullptr)},
+                {"filament_preset", context_name.empty() ? json(nullptr) : json(context_name)},
+                {"object_id", object_id >= 0 ? json(object_id) : json(nullptr)},
+                {"volume_id", volume_id >= 0 ? json(volume_id) : json(nullptr)}
+            }},
+            {"definitions", std::move(definitions)},
+            {"mutated", false}
+        };
+    });
+}
+
+json preview_settings_update(const json& args)
+{
+    const std::string scope = args.value("scope", "print");
+    if (scope != "print" && scope != "filament" && scope != "printer" &&
+        scope != "object" && scope != "volume")
+        return {{"error", "scope must be print, filament, printer, object, or volume"}};
+    if (!args.contains("values") || !args["values"].is_object() || args["values"].empty())
+        return {{"error", "values must be a non-empty object of serialized setting strings"}};
+
+    int filament_index = -1;
+    int object_id = -1;
+    int volume_id = -1;
+    for (const auto& item : std::array<std::pair<const char*, int*>, 3>{{
+            {"filament_index", &filament_index}, {"object_id", &object_id}, {"volume_id", &volume_id}}}) {
+        if (!args.contains(item.first))
+            continue;
+        if (!args[item.first].is_number_integer() || args[item.first].get<int>() < 0)
+            return {{"error", std::string(item.first) + " must be a non-negative integer"}};
+        *item.second = args[item.first].get<int>();
+    }
+    if (scope == "object" && object_id < 0)
+        return {{"error", "object_id is required for object scope"}};
+    if (scope == "volume" && (object_id < 0 || volume_id < 0))
+        return {{"error", "object_id and volume_id are required for volume scope"}};
+    if (scope != "filament" && filament_index >= 0)
+        return {{"error", "filament_index is only valid for filament scope"}};
+    if (scope != "object" && scope != "volume" && object_id >= 0)
+        return {{"error", "object_id is only valid for object or volume scope"}};
+    if (scope != "volume" && volume_id >= 0)
+        return {{"error", "volume_id is only valid for volume scope"}};
+
+    const json values = args["values"];
+    return on_gui_thread([scope, values, filament_index, object_id, volume_id]() {
+        PresetBundle* bundle = wxGetApp().preset_bundle;
+        if (bundle == nullptr)
+            throw std::runtime_error("Preset bundle is not available");
+
+        DynamicPrintConfig* print_config = require_tab(Preset::TYPE_PRINT)->get_config();
+        const DynamicPrintConfig* local_config = nullptr;
+        const DynamicPrintConfig* inherited_config = nullptr;
+        const DynamicPrintConfig* second_inherited_config = nullptr;
+        DynamicPrintConfig candidate;
+        std::string context_name;
+        int resolved_filament_index = filament_index;
+
+        if (scope == "print" || scope == "printer") {
+            Tab* tab = require_tab(preset_type(scope));
+            local_config = tab->get_config();
+            candidate = DynamicPrintConfig(*local_config);
+            if (tab->get_presets() != nullptr)
+                context_name = tab->get_presets()->get_edited_preset().name;
+        } else if (scope == "filament") {
+            if (bundle->filament_presets.empty())
+                throw std::runtime_error("Project has no filament slots");
+            if (resolved_filament_index < 0 && bundle->filament_presets.size() != 1)
+                throw std::runtime_error("Project has multiple filament slots; provide filament_index");
+            if (resolved_filament_index < 0)
+                resolved_filament_index = 0;
+            const size_t index = static_cast<size_t>(resolved_filament_index);
+            if (index >= bundle->filament_presets.size())
+                throw std::runtime_error("filament_index is out of range");
+            context_name = bundle->filament_presets[index];
+            const Preset* preset = bundle->filaments.find_preset(context_name, false);
+            if (preset == nullptr)
+                throw std::runtime_error("Assigned filament preset was not found");
+            local_config = &preset->config;
+            candidate = DynamicPrintConfig(*local_config);
+        } else {
+            Plater* plater = require_plater();
+            ModelObject* object = require_model_object(plater, object_id);
+            auto* model_tab = dynamic_cast<TabPrintModel*>(wxGetApp().get_model_tab());
+            if (model_tab == nullptr)
+                throw std::runtime_error("QIDI object settings tab is not available");
+            if (scope == "object") {
+                local_config = &object->config.get();
+                inherited_config = print_config;
+            } else {
+                local_config = &require_model_volume(object, volume_id)->config.get();
+                inherited_config = &object->config.get();
+                second_inherited_config = print_config;
+            }
+            candidate = DynamicPrintConfig(*local_config);
+        }
+
+        auto effective_before = [local_config, inherited_config, second_inherited_config](
+                                    const std::string& key) -> const ConfigOption* {
+            if (const ConfigOption* option = local_config->option(key); option != nullptr)
+                return option;
+            if (inherited_config != nullptr) {
+                if (const ConfigOption* option = inherited_config->option(key); option != nullptr)
+                    return option;
+            }
+            return second_inherited_config != nullptr ? second_inherited_config->option(key) : nullptr;
+        };
+
+        auto source_before = [local_config, inherited_config, scope](const std::string& key) {
+            if (scope == "object")
+                return local_config->option(key) != nullptr ? std::string("object_override") : std::string("print_preset");
+            if (scope == "volume") {
+                if (local_config->option(key) != nullptr) return std::string("volume_override");
+                if (inherited_config != nullptr && inherited_config->option(key) != nullptr)
+                    return std::string("object_override");
+                return std::string("print_preset");
+            }
+            return std::string("active_") + scope + "_settings";
+        };
+
+        auto* model_tab = dynamic_cast<TabPrintModel*>(wxGetApp().get_model_tab());
+        json parse_errors = json::array();
+        json normalized = json::object();
+        json changes = json::array();
+        std::vector<std::string> changed_keys;
+        bool would_change = false;
+
+        for (auto it = values.begin(); it != values.end(); ++it) {
+            const std::string key = it.key();
+            if (!it.value().is_string()) {
+                parse_errors.push_back({{"key", key}, {"message", "Value must use QIDI's serialized string format"}});
+                continue;
+            }
+            const ConfigOptionDef* definition = print_config_def.get(key);
+            const ConfigOption* before = effective_before(key);
+            if (definition == nullptr || before == nullptr) {
+                parse_errors.push_back({{"key", key}, {"message", "Setting is not available in the requested scope"}});
+                continue;
+            }
+            if ((scope == "object" || scope == "volume") &&
+                (model_tab == nullptr || !model_tab->has_key(key))) {
+                parse_errors.push_back({{"key", key}, {"message", "Setting is not available at object or volume scope"}});
+                continue;
+            }
+            if (definition->readonly) {
+                parse_errors.push_back({{"key", key}, {"message", "Setting is read-only"}});
+                continue;
+            }
+
+            const bool overridden_before = (scope == "object" || scope == "volume") &&
+                                           local_config->option(key) != nullptr;
+            try {
+                if (candidate.option(key) == nullptr)
+                    candidate.set_key_value(key, before->clone());
+                candidate.set_deserialize_strict(key, it.value().get<std::string>());
+                const std::string before_value = before->serialize();
+                const std::string after_value = candidate.option(key)->serialize();
+                const bool key_would_change = before_value != after_value ||
+                                              ((scope == "object" || scope == "volume") && !overridden_before);
+                would_change = would_change || key_would_change;
+                normalized[key] = after_value;
+                changed_keys.push_back(key);
+                changes.push_back({
+                    {"key", key},
+                    {"before", before_value},
+                    {"after", after_value},
+                    {"changed", key_would_change},
+                    {"source_before", source_before(key)},
+                    {"source_after", scope == "object" ? "object_override" :
+                                     (scope == "volume" ? "volume_override" : "active_" + scope + "_settings")},
+                    {"overridden_before", scope == "object" || scope == "volume" ? json(overridden_before) : json(nullptr)},
+                    {"overridden_after", scope == "object" || scope == "volume" ? json(true) : json(nullptr)}
+                });
+            } catch (const std::exception& error) {
+                parse_errors.push_back({{"key", key}, {"message", error.what()}});
+            }
+        }
+
+        DynamicPrintConfig baseline_full = bundle->full_config();
+        const auto baseline_errors = baseline_full.validate(false);
+        DynamicPrintConfig candidate_full(baseline_full);
+        if (parse_errors.empty()) {
+            for (const std::string& key : changed_keys) {
+                const ConfigOption* source = candidate.option(key);
+                if (scope == "filament" && resolved_filament_index >= 0) {
+                    ConfigOption* target = candidate_full.option_throw(key);
+                    if (target->is_vector()) {
+                        auto* target_vector = dynamic_cast<ConfigOptionVectorBase*>(target);
+                        if (target_vector == nullptr)
+                            throw std::runtime_error("QIDI vector setting could not be indexed: " + key);
+                        target_vector->set_at(source, static_cast<size_t>(resolved_filament_index), 0);
+                    } else {
+                        target->set(source);
+                    }
+                } else {
+                    candidate_full.set_key_value(key, source->clone());
+                }
+            }
+        }
+        const auto candidate_errors = parse_errors.empty() ? candidate_full.validate(false) : baseline_errors;
+        const json introduced_errors = introduced_validation_errors(baseline_errors, candidate_errors);
+        const bool valid = parse_errors.empty() && candidate_errors.empty();
+
+        return json{
+            {"scope", scope},
+            {"context", {
+                {"preset", context_name.empty() ? json(nullptr) : json(context_name)},
+                {"filament_index", resolved_filament_index >= 0 ? json(resolved_filament_index) : json(nullptr)},
+                {"object_id", object_id >= 0 ? json(object_id) : json(nullptr)},
+                {"volume_id", volume_id >= 0 ? json(volume_id) : json(nullptr)}
+            }},
+            {"valid", valid},
+            {"mutated", false},
+            {"would_change", would_change},
+            {"would_invalidate_slice", would_change},
+            {"would_mark_project_or_preset_dirty", would_change},
+            {"normalized_values", std::move(normalized)},
+            {"changes", std::move(changes)},
+            {"parse_errors", std::move(parse_errors)},
+            {"validation", {
+                {"baseline_valid", baseline_errors.empty()},
+                {"baseline_error_count", baseline_errors.size()},
+                {"candidate_valid", candidate_errors.empty()},
+                {"candidate_error_count", candidate_errors.size()},
+                {"candidate_errors", validation_errors_to_json(candidate_errors)},
+                {"introduced_errors", introduced_errors},
+                {"introduced_error_count", introduced_errors.size()}
+            }}
+        };
     });
 }
 
@@ -4074,7 +4547,7 @@ json export_gcode(const json& args)
 json get_suite_capabilities()
 {
     return {
-        {"suite_version", "1.8.0"},
+        {"suite_version", "1.9.0"},
         {"qidi_target", "2.7.2.10"},
         {"capability_tiers", {
             {"native", json::array({
@@ -4086,7 +4559,8 @@ json get_suite_capabilities()
                 "confirmation_gated_local_print_start", "tunnel_health_reporting",
                 "printer_monitoring_snapshot", "printer_case_light_control",
                 "adaptive_layer_height_profiles", "geometric_surface_selection",
-                "painted_support_facets", "painted_seam_facets"
+                "painted_support_facets", "painted_seam_facets",
+                "native_setting_definitions", "non_mutating_settings_update_preview"
             })},
             {"computed", json::array({
                 "mesh_diagnostics", "overhang_and_contact_estimates", "orientation_candidates",
@@ -4112,6 +4586,7 @@ json get_suite_capabilities()
             {"camera_light_enabled_before_capture", true},
             {"monitoring_never_controls_print", true},
             {"surface_selection_previews_never_mutate", true},
+            {"settings_update_previews_never_mutate", true},
             {"surface_paint_mutations_are_undoable", true},
             {"tunnel_credentials_never_returned", true},
             {"gui_call_timeout_seconds", 30}
@@ -5507,6 +5982,8 @@ json tools_list()
         {"x", {{"type", "number"}}}, {"y", {{"type", "number"}}}, {"z", {{"type", "number"}}}
     }}, {"additionalProperties", false}};
     const json scope = {{"type", "string"}, {"enum", json::array({"print", "filament", "printer"})}};
+    const json setting_scope = {{"type", "string"},
+                                {"enum", json::array({"print", "filament", "printer", "object", "volume"})}};
     const json surface_vec3 = {
         {"type", "object"},
         {"properties", {{"x", {{"type", "number"}}},
@@ -5631,8 +6108,28 @@ json tools_list()
         "Remove selected volume-scope overrides so those settings inherit from the object or active print preset.",
         {{"object_id", integer_id}, {"volume_id", integer_id},
          {"keys", {{"type", "array"}, {"minItems", 1},
-                   {"items", {{"type", "string"}}}}}},
+                    {"items", {{"type", "string"}}}}}},
         {"object_id", "volume_id", "keys"}));
+    tools.push_back(tool_definition("list_setting_definitions",
+        "Search and paginate QIDI's native setting metadata, supported scopes, serialized defaults, limits, enum choices, and optional current/effective values.",
+        {{"scope", setting_scope},
+         {"query", {{"type", "string"}, {"default", ""}}},
+         {"category", {{"type", "string"}, {"default", ""}}},
+         {"filament_index", integer_id},
+         {"object_id", integer_id},
+         {"volume_id", integer_id},
+         {"offset", {{"type", "integer"}, {"minimum", 0}, {"default", 0}}},
+         {"limit", {{"type", "integer"}, {"minimum", 1}, {"maximum", 500}, {"default", 100}}}},
+        {"scope"}));
+    tools.push_back(tool_definition("preview_settings_update",
+        "Strictly parse and normalize a proposed print, filament, printer, object, or volume settings update without mutation; report inheritance, slice invalidation, and native full-configuration validation.",
+        {{"scope", setting_scope},
+         {"filament_index", integer_id},
+         {"object_id", integer_id},
+         {"volume_id", integer_id},
+         {"values", {{"type", "object"}, {"minProperties", 1},
+                     {"additionalProperties", {{"type", "string"}}}}}},
+        {"scope", "values"}));
     tools.push_back(tool_definition("get_layer_height_profile",
         "Inspect one object's stored variable layer-height profile and its effective profile under the active presets.",
         {{"object_id", integer_id}}, {"object_id"}));
@@ -5991,7 +6488,7 @@ json handle_rpc(QDSDeviceManager* manager, const json& request)
             {"result", {
                 {"protocolVersion", "2025-06-18"},
                 {"capabilities", {{"tools", {{"listChanged", false}}}}},
-                {"serverInfo", {{"name", "qidi-studio"}, {"version", "1.8.0"}}}
+                {"serverInfo", {{"name", "qidi-studio"}, {"version", "1.9.0"}}}
             }}
         };
     }
@@ -6068,6 +6565,10 @@ json handle_rpc(QDSDeviceManager* manager, const json& request)
             payload = set_volume_settings(arguments);
         else if (tool_name == "reset_volume_settings")
             payload = reset_volume_settings(arguments);
+        else if (tool_name == "list_setting_definitions")
+            payload = list_setting_definitions(arguments);
+        else if (tool_name == "preview_settings_update")
+            payload = preview_settings_update(arguments);
         else if (tool_name == "get_layer_height_profile")
             payload = get_layer_height_profile(arguments);
         else if (tool_name == "preview_adaptive_layer_height")

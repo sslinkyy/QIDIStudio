@@ -1,5 +1,20 @@
 # QIDI Studio MCP Changelog
 
+## v1.9.0
+
+- Status: Windows x64 build and live acceptance passed. Tool count: 117.
+- Added `list_setting_definitions` for searchable, paginated native setting metadata across print, filament, printer, object, and volume scopes.
+- Setting definitions now expose QIDI's canonical type, unit, default, numeric bounds, enum choices, category, complexity mode, read-only state, supported scopes, and contextual effective/inherited values.
+- Added `preview_settings_update` for strict, non-mutating parsing and normalization of proposed changes across all five settings scopes.
+- Preview results report effective-value inheritance, override creation, whether the slice would be invalidated, and copied full-configuration validation.
+- Native validation distinguishes pre-existing active-configuration errors from errors introduced by the proposed update.
+- Updated the MCP suite version to `1.9.0`; registry count is now 117 tool definitions and 117 dispatch handlers.
+- Windows x64 `RelWithDebInfo` build completed successfully in 00:45:15.07.
+- Connector refresh exposed all 117 tools and reported suite `1.9.0` against QIDI Studio `2.7.2.10`.
+- Live `list_setting_definitions` returned 280 print-scope definitions with native metadata and `mutated: false`.
+- Live `preview_settings_update` normalized and validated a proposed layer-height change, correctly predicted slice invalidation and dirty state, and left the setting and both dirty flags unchanged.
+- The malformed-value preview returned a strict parse error without mutation.
+
 ## v1.8.0
 
 - Added the integrated Windows MCP Tunnel Manager for configuration, status, Start, Stop, Restart, Diagnostics, dashboard access, logs, documentation, and copying connection information.
