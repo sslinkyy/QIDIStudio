@@ -6,6 +6,7 @@
 - Fixed Tunnel Manager **Save / Repair and Connect** so it reuses an existing current-user DPAPI credential when the Runtime API key field is empty, while still requiring a key for first-time setup or intentional replacement.
 - Classified a missing local Codex plugin as informational for ChatGPT tunnel connections, allowing the existing OAuth and verified health-listener compatibility findings to be presented correctly.
 - Applied the same compatibility rules to setup preflight while preserving failures for unexpected findings.
+- Made repair stop and verify the managed tunnel client before replacing its executable, including an orphan left by an interrupted repair.
 - Updated MCP `serverInfo.version` and `get_suite_capabilities().suite_version` to `1.9.1`.
 
 ## v1.9.0

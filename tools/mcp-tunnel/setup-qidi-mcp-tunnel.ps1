@@ -26,6 +26,26 @@ $installedClient = Join-Path $installDirectory 'tunnel-client.exe'
 $secretPath = Join-Path $installDirectory 'tunnel-key.dpapi'
 $configPath = Join-Path $installDirectory 'tunnel.json'
 
+function Get-InstalledTunnelClientProcesses([string] $ExecutablePath) {
+    $expectedPath = [IO.Path]::GetFullPath($ExecutablePath)
+    return @(Get-CimInstance Win32_Process -Filter "Name = 'tunnel-client.exe'" -ErrorAction SilentlyContinue |
+        Where-Object {
+            if (-not $_.ExecutablePath) {
+                $false
+            }
+            else {
+                try {
+                    [String]::Equals([IO.Path]::GetFullPath([string] $_.ExecutablePath),
+                                     $expectedPath,
+                                     [StringComparison]::OrdinalIgnoreCase)
+                }
+                catch {
+                    $false
+                }
+            }
+        })
+}
+
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw 'This guided setup is supported only on Windows'
 }
@@ -232,6 +252,28 @@ if ($null -ne $existingTask -and $existingTask.State -eq 'Running') {
         Remove-Item -LiteralPath $temporarySecretPath -Force -ErrorAction SilentlyContinue
         throw "Existing tunnel task did not stop within 10 seconds: $TaskName"
     }
+}
+
+# Stopping the scheduled PowerShell supervisor can leave its native child alive
+# briefly (or orphaned after an interrupted repair). Terminate only processes
+# whose executable path exactly matches the managed installed client before
+# replacing that file.
+$clientStopDeadline = [DateTime]::UtcNow.AddSeconds(10)
+do {
+    $installedClientProcesses = @(Get-InstalledTunnelClientProcesses -ExecutablePath $installedClient)
+    foreach ($installedClientProcess in $installedClientProcesses) {
+        Stop-Process -Id $installedClientProcess.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    if ($installedClientProcesses.Count -eq 0) {
+        break
+    }
+    Start-Sleep -Milliseconds 200
+} while ([DateTime]::UtcNow -lt $clientStopDeadline)
+
+$remainingInstalledClientProcesses = @(Get-InstalledTunnelClientProcesses -ExecutablePath $installedClient)
+if ($remainingInstalledClientProcesses.Count -gt 0) {
+    Remove-Item -LiteralPath $temporarySecretPath -Force -ErrorAction SilentlyContinue
+    throw "Existing tunnel client did not stop within 10 seconds: process $($remainingInstalledClientProcesses.ProcessId -join ', ')"
 }
 
 try {
