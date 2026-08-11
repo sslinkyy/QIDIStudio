@@ -274,9 +274,10 @@ try {
             $result = Get-TunnelState
 
             # QIDI Studio uses the Runtime API key at the tunnel boundary, so local
-            # OAuth discovery metadata is optional. A running tunnel also owns its
-            # health listener by design. Reclassify only those exact findings and
-            # only after verifying that the configured tunnel executable owns it.
+            # OAuth discovery metadata is optional. ChatGPT tunnel connections do
+            # not require a local Codex plugin. A running tunnel also owns its health
+            # listener by design. Reclassify only those exact findings and only after
+            # verifying that the configured tunnel executable owns the listener.
             $failedChecksMatch = [regex]::Match($doctorText, '(?m)^FAILED_CHECKS\s+([^\r\n]+)\s*$')
             $failedChecks = @()
             if ($failedChecksMatch.Success) {
@@ -286,6 +287,9 @@ try {
             $oauthMetadataExpected = $failedChecks -contains 'oauth_metadata' -and
                 $doctorText -match '(?m)^CHECK\s+mcp_server_reachable\s+PASS\b' -and
                 $doctorText -match '(?m)^CHECK\s+oauth_metadata\s+FAIL\b'
+
+            $codexPluginExpected = $failedChecks -contains 'codex_plugin' -and
+                $doctorText -match '(?m)^CHECK\s+codex_plugin\s+FAIL\b'
 
             $verifiedHealthListener = $false
             if ($failedChecks -contains 'health_listener' -and $result.healthy) {
@@ -304,6 +308,7 @@ try {
 
             $unexpectedChecks = @($failedChecks | Where-Object {
                 ($_ -ne 'oauth_metadata' -or -not $oauthMetadataExpected) -and
+                ($_ -ne 'codex_plugin' -or -not $codexPluginExpected) -and
                 ($_ -ne 'health_listener' -or -not $healthListenerExpected)
             })
             $compatibilityOnly = $doctorExitCode -ne 0 -and
@@ -317,6 +322,9 @@ try {
                 if ($summaryMatch.Success) { $doctorText = $summaryMatch.Value.TrimEnd() }
                 if ($oauthMetadataExpected) {
                     $doctorText = [regex]::Replace($doctorText, '(?m)^CHECK\s+oauth_metadata\s+FAIL[^\r\n]*$', 'CHECK oauth_metadata       INFO optional for the QIDI API-key tunnel')
+                }
+                if ($codexPluginExpected) {
+                    $doctorText = [regex]::Replace($doctorText, '(?m)^CHECK\s+codex_plugin\s+FAIL[^\r\n]*$', 'CHECK codex_plugin         INFO not required for ChatGPT tunnel connections')
                 }
                 if ($healthListenerExpected) {
                     $doctorText = [regex]::Replace($doctorText, '(?m)^CHECK\s+health_listener\s+FAIL[^\r\n]*$', 'CHECK health_listener      PASS active configured tunnel owns 127.0.0.1:8080')

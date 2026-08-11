@@ -216,6 +216,8 @@ void TunnelManagerDialog::refresh_status()
     wxString output;
     wxString error;
     if (!run_script("manage-qidi-mcp-tunnel.ps1", "-Action status", wxEmptyString, output, error)) {
+        m_tunnel_configured = false;
+        m_credentials_configured = false;
         m_overall_status->SetLabel(_L("Unavailable"));
         m_task_status->SetLabel(error.empty() ? _L("Not installed") : error);
         m_heartbeat_status->SetLabel("-");
@@ -246,6 +248,8 @@ void TunnelManagerDialog::refresh_status()
         if (heartbeat_age == "null")
             heartbeat_age.clear();
         m_local_mcp_url = from_u8(status.get<std::string>("local_mcp_url", "http://127.0.0.1:8765/mcp"));
+        m_tunnel_configured = configured;
+        m_credentials_configured = credentials;
 
         m_overall_status->SetLabel(healthy ? _L("Connected") : (configured ? _L("Configured, not connected") : _L("Not configured")));
         m_task_status->SetLabel(from_u8(task_state));
@@ -263,6 +267,8 @@ void TunnelManagerDialog::refresh_status()
         m_restart_button->Enable(configured);
     }
     catch (const std::exception& exception) {
+        m_tunnel_configured = false;
+        m_credentials_configured = false;
         m_overall_status->SetLabel(_L("Status error"));
         m_task_status->SetLabel(from_u8(exception.what()));
     }
@@ -279,26 +285,36 @@ void TunnelManagerDialog::configure_tunnel()
         return;
     }
     wxString api_key = m_api_key->GetValue();
-    if (api_key.length() < 8) {
+    if (!api_key.empty() && api_key.length() < 8) {
         wxMessageBox(_L("Enter the Runtime API key to configure or replace the saved key."),
+                     _L("Runtime API Key Required"), wxOK | wxICON_WARNING, this);
+        return;
+    }
+    const bool replace_api_key = !api_key.empty();
+    if (!replace_api_key && (!m_tunnel_configured || !m_credentials_configured)) {
+        wxMessageBox(_L("Enter the Runtime API key because no reusable DPAPI credential is configured."),
                      _L("Runtime API Key Required"), wxOK | wxICON_WARNING, this);
         return;
     }
 
     wxString output;
     wxString error;
-    const wxString arguments = wxString::Format("-TunnelId \"%s\" -FromEnvironment -SkipBrowser", tunnel_id);
+    const wxString credential_argument = replace_api_key ? "-FromEnvironment" : "-ReuseExistingCredential";
+    const wxString arguments = wxString::Format("-TunnelId \"%s\" %s -SkipBrowser", tunnel_id, credential_argument);
     bool success = false;
     {
-        wxBusyInfo busy(_L("Configuring the MCP tunnel..."), this);
-        success = run_script("setup-qidi-mcp-tunnel.ps1", arguments, api_key, output, error);
+        wxBusyInfo busy(replace_api_key ? _L("Configuring the MCP tunnel...") : _L("Repairing the MCP tunnel..."), this);
+        success = run_script("setup-qidi-mcp-tunnel.ps1", arguments,
+                             replace_api_key ? api_key : wxEmptyString, output, error);
     }
     api_key.clear();
     m_api_key->Clear();
     if (!success) {
         wxMessageBox(error.empty() ? output : error, _L("Tunnel Setup Failed"), wxOK | wxICON_ERROR, this);
     } else {
-        wxMessageBox(_L("The tunnel was configured and started. The Runtime API key is now protected with Windows DPAPI."),
+        wxMessageBox(replace_api_key
+                         ? _L("The tunnel was configured and started. The Runtime API key is now protected with Windows DPAPI.")
+                         : _L("The tunnel was repaired and started using the existing DPAPI-protected Runtime API key."),
                      _L("MCP Tunnel Connected"), wxOK | wxICON_INFORMATION, this);
     }
     refresh_status();
