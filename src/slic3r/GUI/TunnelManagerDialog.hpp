@@ -34,6 +34,8 @@ private:
     wxButton*     m_start_button { nullptr };
     wxButton*     m_stop_button { nullptr };
     wxButton*     m_restart_button { nullptr };
+    bool          m_tunnel_configured { false };
+    bool          m_credentials_configured { false };
     wxString      m_local_mcp_url { "http://127.0.0.1:8765/mcp" };
 };
 

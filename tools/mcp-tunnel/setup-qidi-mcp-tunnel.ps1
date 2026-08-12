@@ -6,7 +6,8 @@ param(
     [string] $TaskName = 'QIDI Studio MCP Tunnel',
     [switch] $SkipBrowser,
     [switch] $SkipDoctor,
-    [switch] $FromEnvironment
+    [switch] $FromEnvironment,
+    [switch] $ReuseExistingCredential
 )
 
 $ErrorActionPreference = 'Stop'
@@ -24,6 +25,26 @@ $installDirectory = Join-Path $env:LOCALAPPDATA 'QIDIStudio-MCP'
 $installedClient = Join-Path $installDirectory 'tunnel-client.exe'
 $secretPath = Join-Path $installDirectory 'tunnel-key.dpapi'
 $configPath = Join-Path $installDirectory 'tunnel.json'
+
+function Get-InstalledTunnelClientProcesses([string] $ExecutablePath) {
+    $expectedPath = [IO.Path]::GetFullPath($ExecutablePath)
+    return @(Get-CimInstance Win32_Process -Filter "Name = 'tunnel-client.exe'" -ErrorAction SilentlyContinue |
+        Where-Object {
+            if (-not $_.ExecutablePath) {
+                $false
+            }
+            else {
+                try {
+                    [String]::Equals([IO.Path]::GetFullPath([string] $_.ExecutablePath),
+                                     $expectedPath,
+                                     [StringComparison]::OrdinalIgnoreCase)
+                }
+                catch {
+                    $false
+                }
+            }
+        })
+}
 
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw 'This guided setup is supported only on Windows'
@@ -85,7 +106,27 @@ if (-not $TunnelId) {
 if ($TunnelId -notmatch '^tunnel_[A-Za-z0-9_-]+$') {
     throw 'Tunnel ID must begin with tunnel_'
 }
-if ($FromEnvironment -and $null -eq $RuntimeApiKey) {
+if ($FromEnvironment -and $ReuseExistingCredential) {
+    throw 'FromEnvironment and ReuseExistingCredential cannot be used together'
+}
+if ($ReuseExistingCredential -and $null -eq $RuntimeApiKey) {
+    $existingSecretPath = $secretPath
+    if ($null -ne $existingConfiguration -and
+        $null -ne $existingConfiguration.PSObject.Properties['secret_path'] -and
+        $existingConfiguration.secret_path) {
+        $existingSecretPath = [string] $existingConfiguration.secret_path
+    }
+    if (-not (Test-Path -LiteralPath $existingSecretPath -PathType Leaf)) {
+        throw "Existing DPAPI-protected Runtime API key was not found: $existingSecretPath"
+    }
+    try {
+        $RuntimeApiKey = (Get-Content -LiteralPath $existingSecretPath -Raw).Trim() | ConvertTo-SecureString
+    }
+    catch {
+        throw "Existing Runtime API key could not be decrypted for the current Windows user: $($_.Exception.Message)"
+    }
+}
+elseif ($FromEnvironment -and $null -eq $RuntimeApiKey) {
     $setupSecretVariable = 'QIDI_MCP_RUNTIME_API_KEY'
     $setupSecret = [Environment]::GetEnvironmentVariable($setupSecretVariable, 'Process')
     if (-not $setupSecret) {
@@ -131,12 +172,54 @@ try {
         }
 
         if ($doctorExitCode -ne 0) {
-            $onlyMissingOauthMetadata =
-                $doctorExitCode -eq 2 -and
-                $doctorText -match '(?m)^FAILED_CHECKS\s+oauth_metadata\s*$' -and
-                $doctorText -match '(?m)^CHECK\s+mcp_server_reachable\s+PASS\b'
-            if ($onlyMissingOauthMetadata) {
-                Write-Warning 'OAuth metadata is not required for the QIDI no-auth loopback profile; continuing setup.'
+            $failedChecksMatch = [regex]::Match($doctorText, '(?m)^FAILED_CHECKS\s+([^\r\n]+)\s*$')
+            $failedChecks = @()
+            if ($failedChecksMatch.Success) {
+                $failedChecks = @($failedChecksMatch.Groups[1].Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            }
+
+            $oauthMetadataExpected = $failedChecks -contains 'oauth_metadata' -and
+                $doctorText -match '(?m)^CHECK\s+mcp_server_reachable\s+PASS\b' -and
+                $doctorText -match '(?m)^CHECK\s+oauth_metadata\s+FAIL\b'
+            $codexPluginExpected = $failedChecks -contains 'codex_plugin' -and
+                $doctorText -match '(?m)^CHECK\s+codex_plugin\s+FAIL\b'
+
+            $verifiedHealthListener = $false
+            if ($failedChecks -contains 'health_listener' -and $null -ne $existingConfiguration -and
+                $null -ne $existingConfiguration.PSObject.Properties['executable'] -and
+                $existingConfiguration.executable) {
+                try {
+                    $configuredExecutablePath = [IO.Path]::GetFullPath([string] $existingConfiguration.executable)
+                    $listeners = @(Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue)
+                    foreach ($listener in $listeners) {
+                        $process = Get-CimInstance Win32_Process -Filter "ProcessId = $($listener.OwningProcess)" -ErrorAction SilentlyContinue
+                        if ($null -ne $process -and $process.ExecutablePath -and
+                            [String]::Equals([IO.Path]::GetFullPath([string] $process.ExecutablePath),
+                                             $configuredExecutablePath,
+                                             [StringComparison]::OrdinalIgnoreCase)) {
+                            $verifiedHealthListener = $true
+                            break
+                        }
+                    }
+                }
+                catch {
+                    $verifiedHealthListener = $false
+                }
+            }
+            $healthListenerExpected = $failedChecks -contains 'health_listener' -and
+                $verifiedHealthListener -and
+                $doctorText -match '(?m)^CHECK\s+health_listener\s+FAIL\b'
+
+            $unexpectedChecks = @($failedChecks | Where-Object {
+                ($_ -ne 'oauth_metadata' -or -not $oauthMetadataExpected) -and
+                ($_ -ne 'codex_plugin' -or -not $codexPluginExpected) -and
+                ($_ -ne 'health_listener' -or -not $healthListenerExpected)
+            })
+            $compatibilityOnly = $failedChecksMatch.Success -and
+                $failedChecks.Count -gt 0 -and
+                $unexpectedChecks.Count -eq 0
+            if ($compatibilityOnly) {
+                Write-Warning 'Doctor reported only expected QIDI/ChatGPT compatibility findings; continuing setup.'
             }
             else {
                 throw "tunnel-client doctor failed with exit code $doctorExitCode. Make sure QIDI Studio is open and the MCP server is running."
@@ -169,6 +252,28 @@ if ($null -ne $existingTask -and $existingTask.State -eq 'Running') {
         Remove-Item -LiteralPath $temporarySecretPath -Force -ErrorAction SilentlyContinue
         throw "Existing tunnel task did not stop within 10 seconds: $TaskName"
     }
+}
+
+# Stopping the scheduled PowerShell supervisor can leave its native child alive
+# briefly (or orphaned after an interrupted repair). Terminate only processes
+# whose executable path exactly matches the managed installed client before
+# replacing that file.
+$clientStopDeadline = [DateTime]::UtcNow.AddSeconds(10)
+do {
+    $installedClientProcesses = @(Get-InstalledTunnelClientProcesses -ExecutablePath $installedClient)
+    foreach ($installedClientProcess in $installedClientProcesses) {
+        Stop-Process -Id $installedClientProcess.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    if ($installedClientProcesses.Count -eq 0) {
+        break
+    }
+    Start-Sleep -Milliseconds 200
+} while ([DateTime]::UtcNow -lt $clientStopDeadline)
+
+$remainingInstalledClientProcesses = @(Get-InstalledTunnelClientProcesses -ExecutablePath $installedClient)
+if ($remainingInstalledClientProcesses.Count -gt 0) {
+    Remove-Item -LiteralPath $temporarySecretPath -Force -ErrorAction SilentlyContinue
+    throw "Existing tunnel client did not stop within 10 seconds: process $($remainingInstalledClientProcesses.ProcessId -join ', ')"
 }
 
 try {

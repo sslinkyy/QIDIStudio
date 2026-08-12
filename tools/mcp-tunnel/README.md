@@ -20,6 +20,8 @@ In QIDI Studio MCP Edition v1.8.0 or later, open **MCP > Tunnel Manager**. The m
 
 The API key is passed only in the setup process environment and is then stored with user-scoped Windows DPAPI. It is never placed in a command line, JSON file, log, or QIDI Studio preference.
 
+When a DPAPI credential is already configured, leave the Runtime API key field empty and click **Save / Repair and Connect** to repair the client, supervisor, configuration, and scheduled task without replacing the key. Enter a Runtime API key only for first-time setup or intentional key replacement.
+
 ## Status
 
 ```powershell

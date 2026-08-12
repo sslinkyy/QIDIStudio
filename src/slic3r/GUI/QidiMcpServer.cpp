@@ -4547,7 +4547,7 @@ json export_gcode(const json& args)
 json get_suite_capabilities()
 {
     return {
-        {"suite_version", "1.9.0"},
+        {"suite_version", "1.9.1"},
         {"qidi_target", "2.7.2.10"},
         {"capability_tiers", {
             {"native", json::array({
@@ -6488,7 +6488,7 @@ json handle_rpc(QDSDeviceManager* manager, const json& request)
             {"result", {
                 {"protocolVersion", "2025-06-18"},
                 {"capabilities", {{"tools", {{"listChanged", false}}}}},
-                {"serverInfo", {{"name", "qidi-studio"}, {"version", "1.9.0"}}}
+                {"serverInfo", {{"name", "qidi-studio"}, {"version", "1.9.1"}}}
             }}
         };
     }
