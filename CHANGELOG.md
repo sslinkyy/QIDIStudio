@@ -1,5 +1,17 @@
 # QIDI Studio MCP Changelog
 
+## v1.10.0
+
+- Status: source patch ready for Windows x64 build and live attachment acceptance. Tool count: 118.
+- Added `import_attached_models` so ChatGPT can pass user-attached STL, 3MF, OBJ, AMF, STEP, STP, or PLY files directly to QIDI Studio using the official `_meta["openai/fileParams"]` contract.
+- Streamed attachments into a randomized per-request directory under the current user's QIDI Studio MCP application-data directory, imported them with QIDI's native model loader, and removed the temporary files after the import attempt.
+- Preserved `import_model` for models that already exist on the QIDI Studio computer.
+- Restricted attachment ingestion to trusted ChatGPT/OpenAI HTTPS file hosts, disabled redirects, limited each file to 256 MiB and each request to 512 MiB, and retained no download URL or local staging path in tool results.
+- Kept QIDI global HTTP headers and tunnel credentials out of attachment requests by using an isolated libcurl download path.
+- Added stale-request cleanup for staging directories left by an interrupted process.
+- Extended native and agent-orchestrated capability reporting for attachment import and the end-to-end conversational print pipeline.
+- Updated MCP `serverInfo.version` and `get_suite_capabilities().suite_version` to `1.10.0`.
+
 ## v1.9.1
 
 - Status: source patch ready for Windows x64 build and live acceptance. Tool count: 117.
