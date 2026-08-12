@@ -1,8 +1,8 @@
-# QIDI Studio MCP Changelog
+﻿# QIDI Studio MCP Changelog
 
 ## v1.10.0
 
-- Status: attachment and enum-serialization acceptance passed; GUI-contention hotfix ready for Windows x64 rebuild and retry test. Tool count: 118.
+- Status: Windows x64 build and live acceptance passed; attachment import, enum serialization, and concurrent-request regression tests completed without HTTP 504. Tool count: 118.
 - Added `import_attached_models` so ChatGPT can pass user-attached STL, 3MF, OBJ, AMF, STEP, STP, or PLY files directly to QIDI Studio using the official `_meta["openai/fileParams"]` contract.
 - Streamed attachments into a randomized per-request directory under the current user's QIDI Studio MCP application-data directory, imported them with QIDI's native model loader, and removed the temporary files after the import attempt.
 - Preserved `import_model` for models that already exist on the QIDI Studio computer.
@@ -261,7 +261,7 @@ Status: source patch prepared; Windows build and live validation pending. Tool c
 
 - Preparation refuses every consolidated preflight blocker, including unsafe CoreXY sequential object order or placement.
 - Start rechecks printer readiness, active plate identity, the locked fingerprint, current preflight, and packaged-file existence before upload.
-- Confirmation tokens expire after 60–1800 seconds, default to 600 seconds, and are consumed before packaging to prevent concurrent reuse.
+- Confirmation tokens expire after 60â€“1800 seconds, default to 600 seconds, and are consumed before packaging to prevent concurrent reuse.
 - The upload runs asynchronously and does not expose the temporary package path, printer address, tunnel credentials, or provider credentials.
 - Automatic camera-based cancellation remains excluded; the existing cancel command still requires separate explicit confirmation.
 
