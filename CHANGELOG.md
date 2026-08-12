@@ -2,7 +2,7 @@
 
 ## v1.10.0
 
-- Status: source patch ready for Windows x64 build and live attachment acceptance. Tool count: 118.
+- Status: attachment acceptance passed; enum-serialization crash hotfix ready for Windows x64 rebuild and settings retest. Tool count: 118.
 - Added `import_attached_models` so ChatGPT can pass user-attached STL, 3MF, OBJ, AMF, STEP, STP, or PLY files directly to QIDI Studio using the official `_meta["openai/fileParams"]` contract.
 - Streamed attachments into a randomized per-request directory under the current user's QIDI Studio MCP application-data directory, imported them with QIDI's native model loader, and removed the temporary files after the import attempt.
 - Preserved `import_model` for models that already exist on the QIDI Studio computer.
@@ -10,6 +10,8 @@
 - Kept QIDI global HTTP headers and tunnel credentials out of attachment requests by using an isolated libcurl download path.
 - Added stale-request cleanup for staging directories left by an interrupted process.
 - Extended native and agent-orchestrated capability reporting for attachment import and the end-to-end conversational print pipeline.
+- Passed the first live ChatGPT attachment import with a 608-bearing STL: the 22 x 22 x 7 mm model downloaded, imported, arranged, and remained available for mesh and printability analysis without slicing.
+- Repaired missing QIDI enum serialization maps on temporary MCP option copies before reading, previewing, changing, fingerprinting, or reporting settings, preventing the observed `ConfigOptionEnumsGenericTempl::serialize()` access violation without mutating active settings during reads or previews.
 - Updated MCP `serverInfo.version` and `get_suite_capabilities().suite_version` to `1.10.0`.
 
 ## v1.9.1

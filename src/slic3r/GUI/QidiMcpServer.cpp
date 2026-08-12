@@ -1112,12 +1112,71 @@ json map_to_json(const std::map<size_t, double>& values)
 
 constexpr double MCP_PI = 3.14159265358979323846;
 
+void repair_config_option_enum_map(const std::string& key, ConfigOption* option)
+{
+    if (option == nullptr)
+        throw std::runtime_error("Setting is unavailable: " + key);
+
+    const ConfigOptionDef* definition = print_config_def.get(key);
+    const t_config_enum_values* enum_keys = definition != nullptr ? definition->enum_keys_map : nullptr;
+    const auto require_enum_keys = [&]() {
+        if (enum_keys == nullptr)
+            throw std::runtime_error("Enum setting has no serialization map: " + key);
+        return enum_keys;
+    };
+
+    if (auto* value = dynamic_cast<ConfigOptionEnumGeneric*>(option);
+        value != nullptr && value->keys_map == nullptr)
+        value->keys_map = require_enum_keys();
+    if (auto* values = dynamic_cast<ConfigOptionEnumsGeneric*>(option);
+        values != nullptr && values->keys_map == nullptr)
+        values->keys_map = require_enum_keys();
+    if (auto* values = dynamic_cast<ConfigOptionEnumsGenericNullable*>(option);
+        values != nullptr && values->keys_map == nullptr)
+        values->keys_map = require_enum_keys();
+}
+
+std::string serialize_config_option(const std::string& key, const ConfigOption* option)
+{
+    if (option == nullptr)
+        throw std::runtime_error("Setting is unavailable: " + key);
+
+    const ConfigOptionDef* definition = print_config_def.get(key);
+    const t_config_enum_values* enum_keys = definition != nullptr ? definition->enum_keys_map : nullptr;
+
+    if (const auto* value = dynamic_cast<const ConfigOptionEnumGeneric*>(option);
+        value != nullptr && value->keys_map == nullptr) {
+        if (enum_keys == nullptr)
+            throw std::runtime_error("Enum setting has no serialization map: " + key);
+        ConfigOptionEnumGeneric repaired(*value);
+        repaired.keys_map = enum_keys;
+        return repaired.serialize();
+    }
+    if (const auto* values = dynamic_cast<const ConfigOptionEnumsGeneric*>(option);
+        values != nullptr && values->keys_map == nullptr) {
+        if (enum_keys == nullptr)
+            throw std::runtime_error("Enum-array setting has no serialization map: " + key);
+        ConfigOptionEnumsGeneric repaired(*values);
+        repaired.keys_map = enum_keys;
+        return repaired.serialize();
+    }
+    if (const auto* values = dynamic_cast<const ConfigOptionEnumsGenericNullable*>(option);
+        values != nullptr && values->keys_map == nullptr) {
+        if (enum_keys == nullptr)
+            throw std::runtime_error("Nullable enum-array setting has no serialization map: " + key);
+        ConfigOptionEnumsGenericNullable repaired(*values);
+        repaired.keys_map = enum_keys;
+        return repaired.serialize();
+    }
+    return option->serialize();
+}
+
 json config_snapshot(const DynamicPrintConfig& config, const std::vector<std::string>& keys)
 {
     json values = json::object();
     for (const std::string& key : keys) {
         const ConfigOption* option = config.option(key);
-        values[key] = option != nullptr ? json(option->serialize()) : json(nullptr);
+        values[key] = option != nullptr ? json(serialize_config_option(key, option)) : json(nullptr);
     }
     return values;
 }
@@ -1177,10 +1236,10 @@ json setting_definition_to_json(const ConfigOptionDef& definition,
         {"category", definition.category},
         {"unit", definition.sidetext},
         {"ratio_over", definition.ratio_over.empty() ? json(nullptr) : json(definition.ratio_over)},
-        {"default_value", definition.default_value ? json(definition.default_value->serialize()) : json(nullptr)},
+        {"default_value", definition.default_value ? json(serialize_config_option(definition.opt_key, definition.default_value.get())) : json(nullptr)},
         {"supported_scopes", supported_scopes},
-        {"current_value", effective != nullptr ? json(effective->serialize()) : json(nullptr)},
-        {"local_value", local != nullptr ? json(local->serialize()) : json(nullptr)},
+        {"current_value", effective != nullptr ? json(serialize_config_option(definition.opt_key, effective)) : json(nullptr)},
+        {"local_value", local != nullptr ? json(serialize_config_option(definition.opt_key, local)) : json(nullptr)},
         {"overridden", value_source == "object_override" || value_source == "volume_override"},
         {"value_source", value_source.empty() ? json(nullptr) : json(value_source)}
     };
@@ -1253,7 +1312,7 @@ std::string first_string_option(const DynamicPrintConfig& config, const std::str
         return value->value;
     if (const auto* values = dynamic_cast<const ConfigOptionStrings*>(option))
         return values->values.empty() ? std::string() : values->values.front();
-    return option->serialize();
+    return serialize_config_option(key, option);
 }
 
 json validation_errors_to_json(const std::map<std::string, std::string>& errors)
@@ -1650,7 +1709,7 @@ std::string print_job_fingerprint(Plater* plater, PartPlate* plate)
     for (const std::string& key : keys) {
         const ConfigOption* option = full.option(key);
         if (option != nullptr)
-            state << ";config:" << key << '=' << option->serialize();
+            state << ";config:" << key << '=' << serialize_config_option(key, option);
     }
 
     if (GCodeProcessorResult* result = plate->get_slice_result(); result != nullptr) {
@@ -2299,7 +2358,8 @@ json get_object_settings(const json& args)
                 throw std::runtime_error("Unknown print setting: " + key);
             }
             const ConfigOption* local_option = local.option(key);
-            values.push_back({{"key", key}, {"value", (local_option != nullptr ? local_option : global_option)->serialize()},
+            values.push_back({{"key", key}, {"value", serialize_config_option(
+                                  key, local_option != nullptr ? local_option : global_option)},
                               {"overridden", local_option != nullptr}});
         }
         return json{{"object_id", object_id}, {"settings", std::move(values)}};
@@ -2332,6 +2392,7 @@ json set_object_settings(const json& args)
                 throw std::runtime_error("Unknown print setting: " + it.key());
             if (updated.option(it.key()) == nullptr)
                 updated.set_key_value(it.key(), global_option->clone());
+            repair_config_option_enum_map(it.key(), updated.option(it.key()));
             updated.set_deserialize_strict(it.key(), it.value().get<std::string>());
         }
 
@@ -2341,7 +2402,8 @@ json set_object_settings(const json& args)
         plater->schedule_background_process();
         json applied = json::object();
         for (auto it = values.begin(); it != values.end(); ++it)
-            applied[it.key()] = object->config.get().option(it.key())->serialize();
+            applied[it.key()] = serialize_config_option(
+                it.key(), object->config.get().option(it.key()));
         return json{{"object_id", object_id}, {"applied", std::move(applied)}};
     });
 }
@@ -2424,7 +2486,7 @@ json get_volume_settings(const json& args)
                                             (object_option != nullptr ? object_option : global_option);
             const char* source = local_option != nullptr ? "volume" :
                                  (object_option != nullptr ? "object" : "print_preset");
-            settings.push_back({{"key", key}, {"value", effective->serialize()},
+            settings.push_back({{"key", key}, {"value", serialize_config_option(key, effective)},
                                 {"overridden", local_option != nullptr}, {"source", source}});
         }
         return json{{"object_id", object_id}, {"volume_id", volume_id},
@@ -2464,6 +2526,7 @@ json set_volume_settings(const json& args)
             const ConfigOption* inherited = object_option != nullptr ? object_option : global_option;
             if (updated.option(it.key()) == nullptr)
                 updated.set_key_value(it.key(), inherited->clone());
+            repair_config_option_enum_map(it.key(), updated.option(it.key()));
             updated.set_deserialize_strict(it.key(), it.value().get<std::string>());
         }
 
@@ -2473,7 +2536,8 @@ json set_volume_settings(const json& args)
         plater->schedule_background_process();
         json applied = json::object();
         for (auto it = values.begin(); it != values.end(); ++it)
-            applied[it.key()] = volume->config.get().option(it.key())->serialize();
+            applied[it.key()] = serialize_config_option(
+                it.key(), volume->config.get().option(it.key()));
         return json{{"object_id", object_id}, {"volume_id", volume_id},
                     {"applied", std::move(applied)}, {"undo_available", plater->can_undo()}};
     });
@@ -2807,9 +2871,10 @@ json preview_settings_update(const json& args)
             try {
                 if (candidate.option(key) == nullptr)
                     candidate.set_key_value(key, before->clone());
+                repair_config_option_enum_map(key, candidate.option(key));
                 candidate.set_deserialize_strict(key, it.value().get<std::string>());
-                const std::string before_value = before->serialize();
-                const std::string after_value = candidate.option(key)->serialize();
+                const std::string before_value = serialize_config_option(key, before);
+                const std::string after_value = serialize_config_option(key, candidate.option(key));
                 const bool key_would_change = before_value != after_value ||
                                               ((scope == "object" || scope == "volume") && !overridden_before);
                 would_change = would_change || key_would_change;
@@ -4049,7 +4114,9 @@ json list_slice_settings(const json& args)
         json settings = json::array();
         for (size_t i = begin; i < end; ++i) {
             const ConfigOption* option = config->option(keys[i]);
-            if (option != nullptr) settings.push_back({{"key", keys[i]}, {"value", option->serialize()}});
+            if (option != nullptr)
+                settings.push_back({{"key", keys[i]},
+                                    {"value", serialize_config_option(keys[i], option)}});
         }
         return json{{"scope", scope}, {"count", keys.size()}, {"offset", begin},
                     {"returned", end - begin}, {"settings", std::move(settings)}};
@@ -4274,7 +4341,7 @@ json get_slice_settings(const json& args)
                 const ConfigOption* option = preset->config.option(key);
                 if (option == nullptr)
                     throw std::runtime_error("Unknown setting for filament: " + key);
-                values[key] = option->serialize();
+                values[key] = serialize_config_option(key, option);
             }
 
             return json{
@@ -4293,7 +4360,7 @@ json get_slice_settings(const json& args)
             const ConfigOption* option = config->option(key);
             if (option == nullptr)
                 throw std::runtime_error("Unknown setting for " + scope + ": " + key);
-            values[key] = option->serialize();
+            values[key] = serialize_config_option(key, option);
         }
         return json{{"scope", scope}, {"values", std::move(values)}};
     });
@@ -4316,13 +4383,15 @@ json set_slice_settings(const json& args)
                 throw std::runtime_error("Setting values must use QIDI's serialized string format");
             if (updated.option(it.key()) == nullptr)
                 throw std::runtime_error("Unknown setting for " + scope + ": " + it.key());
+            repair_config_option_enum_map(it.key(), updated.option(it.key()));
             updated.set_deserialize_strict(it.key(), it.value().get<std::string>());
         }
         tab->load_config(updated);
 
         json applied = json::object();
         for (auto it = values.begin(); it != values.end(); ++it)
-            applied[it.key()] = tab->get_config()->option(it.key())->serialize();
+            applied[it.key()] = serialize_config_option(
+                it.key(), tab->get_config()->option(it.key()));
         return json{{"scope", scope}, {"applied", std::move(applied)}};
     });
 }
@@ -4354,7 +4423,7 @@ json reset_slice_settings(const json& args)
             if (saved_option == nullptr)
                 throw std::runtime_error("The saved preset has no value for " + scope + " setting: " + key);
             updated.set_key_value(key, saved_option->clone());
-            reset[key] = saved_option->serialize();
+            reset[key] = serialize_config_option(key, saved_option);
         }
         tab->load_config(updated);
         return json{{"scope", scope}, {"preset", saved.name}, {"reset", std::move(reset)}};
@@ -5134,8 +5203,10 @@ json preview_profile_changes(const json& args)
                 throw std::runtime_error("Setting values must use QIDI's serialized string format");
             if (updated.option(it.key()) == nullptr)
                 throw std::runtime_error("Unknown setting for " + scope + ": " + it.key());
+            repair_config_option_enum_map(it.key(), updated.option(it.key()));
             updated.set_deserialize_strict(it.key(), it.value().get<std::string>());
-            normalized[it.key()] = updated.option(it.key())->serialize();
+            normalized[it.key()] = serialize_config_option(
+                it.key(), updated.option(it.key()));
         }
         return json{{"scope", scope}, {"base_preset", base->name},
                     {"normalized_values", std::move(normalized)}, {"mutated", false}};
@@ -5175,6 +5246,7 @@ json create_profile_variant(const json& args)
                 throw std::runtime_error("Setting values must use QIDI's serialized string format");
             if (updated.option(it.key()) == nullptr)
                 throw std::runtime_error("Unknown setting for " + scope + ": " + it.key());
+            repair_config_option_enum_map(it.key(), updated.option(it.key()));
             updated.set_deserialize_strict(it.key(), it.value().get<std::string>());
         }
         tab->load_config(updated);
@@ -6047,7 +6119,7 @@ json prepare_print_job(QDSDeviceManager* manager, const json& args)
         DynamicPrintConfig full = bundle->full_config();
         const auto setting = [&full](const char* key) -> json {
             const ConfigOption* option = full.option(key);
-            return option != nullptr ? json(option->serialize()) : json(nullptr);
+            return option != nullptr ? json(serialize_config_option(key, option)) : json(nullptr);
         };
         json summary{
             {"project", {{"name", into_u8(plater->get_project_name())},
