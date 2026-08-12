@@ -427,7 +427,10 @@ json on_gui_thread(Fn fn)
         std::atomic<int> phase{0}; // 0 queued, 1 executing, 2 cancelled before execution
     };
 
-    std::lock_guard<std::mutex> serialize(gui_call_mutex());
+    std::unique_lock<std::mutex> serialize(gui_call_mutex(), std::try_to_lock);
+    if (!serialize.owns_lock())
+        return {{"error", "Another QIDI Studio MCP GUI request is still running"},
+                {"error_code", "GUI_BUSY"}, {"retry_after_ms", 250}};
     auto promise = std::make_shared<std::promise<json>>();
     auto future  = promise->get_future();
     auto state   = std::make_shared<InvocationState>();
