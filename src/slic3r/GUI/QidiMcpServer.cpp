@@ -20,6 +20,7 @@
 #include <boost/asio.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/nowide/fstream.hpp>
+#include <curl/curl.h>
 #include <nlohmann/json.hpp>
 
 #include <wx/bitmap.h>
@@ -73,6 +74,9 @@ using tcp  = boost::asio::ip::tcp;
 constexpr unsigned short MCP_PORT = 8765;
 constexpr std::size_t MAX_REQUEST_BYTES = 1024 * 1024;
 constexpr std::size_t MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+constexpr std::size_t MAX_ATTACHED_MODEL_FILE_BYTES = 256 * 1024 * 1024;
+constexpr std::size_t MAX_ATTACHED_MODEL_TOTAL_BYTES = 512 * 1024 * 1024;
+constexpr std::size_t MAX_ATTACHED_MODEL_FILES = 8;
 constexpr auto GUI_CALL_TIMEOUT = std::chrono::seconds(30);
 constexpr auto PRINT_TOKEN_DEFAULT_TTL = std::chrono::seconds(600);
 constexpr auto PRINT_TOKEN_MAX_TTL = std::chrono::seconds(1800);
@@ -423,7 +427,10 @@ json on_gui_thread(Fn fn)
         std::atomic<int> phase{0}; // 0 queued, 1 executing, 2 cancelled before execution
     };
 
-    std::lock_guard<std::mutex> serialize(gui_call_mutex());
+    std::unique_lock<std::mutex> serialize(gui_call_mutex(), std::try_to_lock);
+    if (!serialize.owns_lock())
+        return {{"error", "Another QIDI Studio MCP GUI request is still running"},
+                {"error_code", "GUI_BUSY"}, {"retry_after_ms", 250}};
     auto promise = std::make_shared<std::promise<json>>();
     auto future  = promise->get_future();
     auto state   = std::make_shared<InvocationState>();
@@ -1108,12 +1115,71 @@ json map_to_json(const std::map<size_t, double>& values)
 
 constexpr double MCP_PI = 3.14159265358979323846;
 
+void repair_config_option_enum_map(const std::string& key, ConfigOption* option)
+{
+    if (option == nullptr)
+        throw std::runtime_error("Setting is unavailable: " + key);
+
+    const ConfigOptionDef* definition = print_config_def.get(key);
+    const t_config_enum_values* enum_keys = definition != nullptr ? definition->enum_keys_map : nullptr;
+    const auto require_enum_keys = [&]() {
+        if (enum_keys == nullptr)
+            throw std::runtime_error("Enum setting has no serialization map: " + key);
+        return enum_keys;
+    };
+
+    if (auto* value = dynamic_cast<ConfigOptionEnumGeneric*>(option);
+        value != nullptr && value->keys_map == nullptr)
+        value->keys_map = require_enum_keys();
+    if (auto* values = dynamic_cast<ConfigOptionEnumsGeneric*>(option);
+        values != nullptr && values->keys_map == nullptr)
+        values->keys_map = require_enum_keys();
+    if (auto* values = dynamic_cast<ConfigOptionEnumsGenericNullable*>(option);
+        values != nullptr && values->keys_map == nullptr)
+        values->keys_map = require_enum_keys();
+}
+
+std::string serialize_config_option(const std::string& key, const ConfigOption* option)
+{
+    if (option == nullptr)
+        throw std::runtime_error("Setting is unavailable: " + key);
+
+    const ConfigOptionDef* definition = print_config_def.get(key);
+    const t_config_enum_values* enum_keys = definition != nullptr ? definition->enum_keys_map : nullptr;
+
+    if (const auto* value = dynamic_cast<const ConfigOptionEnumGeneric*>(option);
+        value != nullptr && value->keys_map == nullptr) {
+        if (enum_keys == nullptr)
+            throw std::runtime_error("Enum setting has no serialization map: " + key);
+        ConfigOptionEnumGeneric repaired(*value);
+        repaired.keys_map = enum_keys;
+        return repaired.serialize();
+    }
+    if (const auto* values = dynamic_cast<const ConfigOptionEnumsGeneric*>(option);
+        values != nullptr && values->keys_map == nullptr) {
+        if (enum_keys == nullptr)
+            throw std::runtime_error("Enum-array setting has no serialization map: " + key);
+        ConfigOptionEnumsGeneric repaired(*values);
+        repaired.keys_map = enum_keys;
+        return repaired.serialize();
+    }
+    if (const auto* values = dynamic_cast<const ConfigOptionEnumsGenericNullable*>(option);
+        values != nullptr && values->keys_map == nullptr) {
+        if (enum_keys == nullptr)
+            throw std::runtime_error("Nullable enum-array setting has no serialization map: " + key);
+        ConfigOptionEnumsGenericNullable repaired(*values);
+        repaired.keys_map = enum_keys;
+        return repaired.serialize();
+    }
+    return option->serialize();
+}
+
 json config_snapshot(const DynamicPrintConfig& config, const std::vector<std::string>& keys)
 {
     json values = json::object();
     for (const std::string& key : keys) {
         const ConfigOption* option = config.option(key);
-        values[key] = option != nullptr ? json(option->serialize()) : json(nullptr);
+        values[key] = option != nullptr ? json(serialize_config_option(key, option)) : json(nullptr);
     }
     return values;
 }
@@ -1173,10 +1239,10 @@ json setting_definition_to_json(const ConfigOptionDef& definition,
         {"category", definition.category},
         {"unit", definition.sidetext},
         {"ratio_over", definition.ratio_over.empty() ? json(nullptr) : json(definition.ratio_over)},
-        {"default_value", definition.default_value ? json(definition.default_value->serialize()) : json(nullptr)},
+        {"default_value", definition.default_value ? json(serialize_config_option(definition.opt_key, definition.default_value.get())) : json(nullptr)},
         {"supported_scopes", supported_scopes},
-        {"current_value", effective != nullptr ? json(effective->serialize()) : json(nullptr)},
-        {"local_value", local != nullptr ? json(local->serialize()) : json(nullptr)},
+        {"current_value", effective != nullptr ? json(serialize_config_option(definition.opt_key, effective)) : json(nullptr)},
+        {"local_value", local != nullptr ? json(serialize_config_option(definition.opt_key, local)) : json(nullptr)},
         {"overridden", value_source == "object_override" || value_source == "volume_override"},
         {"value_source", value_source.empty() ? json(nullptr) : json(value_source)}
     };
@@ -1249,7 +1315,7 @@ std::string first_string_option(const DynamicPrintConfig& config, const std::str
         return value->value;
     if (const auto* values = dynamic_cast<const ConfigOptionStrings*>(option))
         return values->values.empty() ? std::string() : values->values.front();
-    return option->serialize();
+    return serialize_config_option(key, option);
 }
 
 json validation_errors_to_json(const std::map<std::string, std::string>& errors)
@@ -1646,7 +1712,7 @@ std::string print_job_fingerprint(Plater* plater, PartPlate* plate)
     for (const std::string& key : keys) {
         const ConfigOption* option = full.option(key);
         if (option != nullptr)
-            state << ";config:" << key << '=' << option->serialize();
+            state << ";config:" << key << '=' << serialize_config_option(key, option);
     }
 
     if (GCodeProcessorResult* result = plate->get_slice_result(); result != nullptr) {
@@ -2295,7 +2361,8 @@ json get_object_settings(const json& args)
                 throw std::runtime_error("Unknown print setting: " + key);
             }
             const ConfigOption* local_option = local.option(key);
-            values.push_back({{"key", key}, {"value", (local_option != nullptr ? local_option : global_option)->serialize()},
+            values.push_back({{"key", key}, {"value", serialize_config_option(
+                                  key, local_option != nullptr ? local_option : global_option)},
                               {"overridden", local_option != nullptr}});
         }
         return json{{"object_id", object_id}, {"settings", std::move(values)}};
@@ -2328,6 +2395,7 @@ json set_object_settings(const json& args)
                 throw std::runtime_error("Unknown print setting: " + it.key());
             if (updated.option(it.key()) == nullptr)
                 updated.set_key_value(it.key(), global_option->clone());
+            repair_config_option_enum_map(it.key(), updated.option(it.key()));
             updated.set_deserialize_strict(it.key(), it.value().get<std::string>());
         }
 
@@ -2337,7 +2405,8 @@ json set_object_settings(const json& args)
         plater->schedule_background_process();
         json applied = json::object();
         for (auto it = values.begin(); it != values.end(); ++it)
-            applied[it.key()] = object->config.get().option(it.key())->serialize();
+            applied[it.key()] = serialize_config_option(
+                it.key(), object->config.get().option(it.key()));
         return json{{"object_id", object_id}, {"applied", std::move(applied)}};
     });
 }
@@ -2420,7 +2489,7 @@ json get_volume_settings(const json& args)
                                             (object_option != nullptr ? object_option : global_option);
             const char* source = local_option != nullptr ? "volume" :
                                  (object_option != nullptr ? "object" : "print_preset");
-            settings.push_back({{"key", key}, {"value", effective->serialize()},
+            settings.push_back({{"key", key}, {"value", serialize_config_option(key, effective)},
                                 {"overridden", local_option != nullptr}, {"source", source}});
         }
         return json{{"object_id", object_id}, {"volume_id", volume_id},
@@ -2460,6 +2529,7 @@ json set_volume_settings(const json& args)
             const ConfigOption* inherited = object_option != nullptr ? object_option : global_option;
             if (updated.option(it.key()) == nullptr)
                 updated.set_key_value(it.key(), inherited->clone());
+            repair_config_option_enum_map(it.key(), updated.option(it.key()));
             updated.set_deserialize_strict(it.key(), it.value().get<std::string>());
         }
 
@@ -2469,7 +2539,8 @@ json set_volume_settings(const json& args)
         plater->schedule_background_process();
         json applied = json::object();
         for (auto it = values.begin(); it != values.end(); ++it)
-            applied[it.key()] = volume->config.get().option(it.key())->serialize();
+            applied[it.key()] = serialize_config_option(
+                it.key(), volume->config.get().option(it.key()));
         return json{{"object_id", object_id}, {"volume_id", volume_id},
                     {"applied", std::move(applied)}, {"undo_available", plater->can_undo()}};
     });
@@ -2803,9 +2874,10 @@ json preview_settings_update(const json& args)
             try {
                 if (candidate.option(key) == nullptr)
                     candidate.set_key_value(key, before->clone());
+                repair_config_option_enum_map(key, candidate.option(key));
                 candidate.set_deserialize_strict(key, it.value().get<std::string>());
-                const std::string before_value = before->serialize();
-                const std::string after_value = candidate.option(key)->serialize();
+                const std::string before_value = serialize_config_option(key, before);
+                const std::string after_value = serialize_config_option(key, candidate.option(key));
                 const bool key_would_change = before_value != after_value ||
                                               ((scope == "object" || scope == "volume") && !overridden_before);
                 would_change = would_change || key_would_change;
@@ -3438,6 +3510,356 @@ json get_seam_paint_state(const json& args) { return get_surface_paint_state(arg
 json set_support_paint(const json& args) { return set_surface_paint(args, true); }
 json set_seam_paint(const json& args) { return set_surface_paint(args, false); }
 
+bool string_ends_with(const std::string& value, const std::string& suffix)
+{
+    return value.size() >= suffix.size() &&
+           value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string attached_file_host(const std::string& url)
+{
+    const std::string lowered = lower_copy(url);
+    constexpr const char* prefix = "https://";
+    if (lowered.rfind(prefix, 0) != 0)
+        return {};
+
+    const std::size_t authority_start = std::strlen(prefix);
+    const std::size_t authority_end = lowered.find_first_of("/?#", authority_start);
+    std::string authority = lowered.substr(authority_start, authority_end - authority_start);
+    if (authority.empty() || authority.find('@') != std::string::npos || authority.front() == '[')
+        return {};
+
+    const std::size_t port = authority.find(':');
+    if (port != std::string::npos) {
+        if (authority.substr(port + 1) != "443")
+            return {};
+        authority.erase(port);
+    }
+    if (authority.empty())
+        return {};
+    return authority;
+}
+
+bool trusted_attached_file_url(const std::string& url)
+{
+    const std::string host = attached_file_host(url);
+    if (host.empty())
+        return false;
+    if (host == "chatgpt.com" || string_ends_with(host, ".chatgpt.com") ||
+        host == "openai.com" || string_ends_with(host, ".openai.com") ||
+        host == "oaiusercontent.com" || string_ends_with(host, ".oaiusercontent.com"))
+        return true;
+    if (string_ends_with(host, ".blob.core.windows.net") &&
+        (host.rfind("oaisdmntpr", 0) == 0 || host.rfind("oaisdsorpr", 0) == 0))
+        return true;
+    if (string_ends_with(host, ".amazonaws.com") && host.rfind("oaisdmntpr", 0) == 0)
+        return true;
+    return false;
+}
+
+std::string attached_model_extension(const json& file)
+{
+    std::string source = file.value("file_name", "");
+    if (source.empty()) {
+        const std::string url = file.value("download_url", "");
+        const std::size_t query = url.find_first_of("?#");
+        const std::string path = url.substr(0, query);
+        const std::size_t slash = path.find_last_of('/');
+        source = slash == std::string::npos ? path : path.substr(slash + 1);
+    }
+
+    std::string extension = lower_copy(boost::filesystem::path(source).extension().string());
+    static const std::set<std::string> supported{
+        ".stl", ".3mf", ".obj", ".amf", ".step", ".stp", ".ply"
+    };
+    return supported.count(extension) > 0 ? extension : std::string();
+}
+
+std::string safe_attached_model_name(const json& file, std::size_t index,
+                                     const std::string& extension)
+{
+    std::string name = boost::filesystem::path(file.value("file_name", "")).filename().string();
+    if (name.empty())
+        name = "attached_model_" + std::to_string(index + 1) + extension;
+
+    std::string safe;
+    safe.reserve(std::min<std::size_t>(name.size(), 120));
+    for (unsigned char character : name) {
+        if (safe.size() >= 120)
+            break;
+        if (std::isalnum(character) || character == ' ' || character == '-' ||
+            character == '_' || character == '.' || character == '(' || character == ')')
+            safe.push_back(static_cast<char>(character));
+        else
+            safe.push_back('_');
+    }
+    if (safe.empty())
+        safe = "attached_model_" + std::to_string(index + 1) + extension;
+    if (lower_copy(boost::filesystem::path(safe).extension().string()) != extension)
+        safe = boost::filesystem::path(safe).stem().string() + extension;
+    return safe;
+}
+
+boost::filesystem::path attached_model_inbox()
+{
+#ifdef __WXMSW__
+    wxString local_app_data;
+    if (!wxGetEnv("LOCALAPPDATA", &local_app_data) || local_app_data.empty())
+        throw std::runtime_error("Windows local application-data directory is unavailable");
+    return boost::filesystem::path(into_u8(local_app_data)) / "QIDIStudio-MCP" / "model-inbox";
+#else
+    return boost::filesystem::temp_directory_path() / "QIDIStudio-MCP" / "model-inbox";
+#endif
+}
+
+void cleanup_stale_attached_model_directories(const boost::filesystem::path& inbox)
+{
+    boost::system::error_code ec;
+    if (!boost::filesystem::is_directory(inbox, ec))
+        return;
+    const std::time_t cutoff = std::time(nullptr) - 24 * 60 * 60;
+    for (boost::filesystem::directory_iterator iterator(inbox, ec), end;
+         !ec && iterator != end; iterator.increment(ec)) {
+        boost::system::error_code entry_error;
+        const boost::filesystem::path path = iterator->path();
+        if (!boost::filesystem::is_directory(path, entry_error))
+            continue;
+        entry_error.clear();
+        const std::time_t modified = boost::filesystem::last_write_time(path, entry_error);
+        if (!entry_error && modified < cutoff)
+            boost::filesystem::remove_all(path, entry_error);
+    }
+}
+
+struct AttachedDownloadSink {
+    boost::nowide::ofstream* output{nullptr};
+    std::size_t bytes{0};
+    std::size_t limit{0};
+    bool limit_exceeded{false};
+    bool write_failed{false};
+};
+
+std::size_t write_attached_model_data(char* data, std::size_t size, std::size_t count, void* context)
+{
+    AttachedDownloadSink* sink = static_cast<AttachedDownloadSink*>(context);
+    if (sink == nullptr || sink->output == nullptr || size == 0)
+        return 0;
+    if (count > std::numeric_limits<std::size_t>::max() / size) {
+        sink->limit_exceeded = true;
+        return 0;
+    }
+    const std::size_t bytes = size * count;
+    if (sink->bytes > sink->limit || bytes > sink->limit - sink->bytes) {
+        sink->limit_exceeded = true;
+        return 0;
+    }
+    sink->output->write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
+    if (!*sink->output) {
+        sink->write_failed = true;
+        return 0;
+    }
+    sink->bytes += bytes;
+    return bytes;
+}
+
+struct AttachedDownloadResult {
+    bool downloaded{false};
+    std::size_t bytes{0};
+    unsigned http_status{0};
+    std::string error;
+};
+
+AttachedDownloadResult download_attached_model(const std::string& url,
+                                               const boost::filesystem::path& destination)
+{
+    AttachedDownloadResult result;
+    boost::nowide::ofstream output(destination.string(), std::ios::binary | std::ios::trunc);
+    if (!output) {
+        result.error = "QIDI Studio could not create the temporary attachment file";
+        return result;
+    }
+
+    Http::tls_global_init();
+    CURL* curl = curl_easy_init();
+    if (curl == nullptr) {
+        result.error = "QIDI Studio could not initialize the attachment download";
+        return result;
+    }
+
+    std::array<char, CURL_ERROR_SIZE> error_buffer{};
+    AttachedDownloadSink sink{&output, 0, MAX_ATTACHED_MODEL_FILE_BYTES};
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "QIDIStudio-MCP/1.10.0");
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer.data());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_attached_model_data);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sink);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(curl, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
+    curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE,
+                     static_cast<curl_off_t>(MAX_ATTACHED_MODEL_FILE_BYTES));
+    curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+
+    const CURLcode code = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_cleanup(curl);
+    output.close();
+
+    result.bytes = sink.bytes;
+    result.http_status = status > 0 ? static_cast<unsigned>(status) : 0;
+    if (sink.limit_exceeded) {
+        result.error = "The attached model exceeds the 256 MiB per-file limit";
+    } else if (sink.write_failed) {
+        result.error = "QIDI Studio could not write the attached model";
+    } else if (code != CURLE_OK) {
+        result.error = "The attached model download failed";
+    } else if (status < 200 || status >= 300) {
+        result.error = status >= 300 && status < 400
+            ? "The attachment URL redirected; request a fresh direct ChatGPT file URL"
+            : "The attachment host rejected the download";
+    } else if (sink.bytes == 0) {
+        result.error = "The attached model is empty";
+    } else {
+        result.downloaded = true;
+    }
+    return result;
+}
+
+struct ScopedAttachedModelDirectory {
+    explicit ScopedAttachedModelDirectory(boost::filesystem::path value) : path(std::move(value)) {}
+    ~ScopedAttachedModelDirectory() { remove(); }
+    bool remove()
+    {
+        if (path.empty())
+            return true;
+        boost::system::error_code ec;
+        boost::filesystem::remove_all(path, ec);
+        if (!ec)
+            path.clear();
+        return !ec;
+    }
+    boost::filesystem::path path;
+};
+
+json import_model(const json& args);
+
+json import_attached_models(const json& args)
+{
+    if (!args.contains("files") || !args["files"].is_array() || args["files"].empty())
+        return {{"error", "files must be a non-empty array of ChatGPT file objects"}};
+    if (args["files"].size() > MAX_ATTACHED_MODEL_FILES)
+        return {{"error", "At most 8 attached model files may be imported at once"}};
+
+    json ready = on_gui_thread([]() {
+        Plater* plater = require_plater();
+        if (plater->is_any_job_running() || plater->is_background_process_slicing())
+            return json{{"ready", false}, {"error", "Wait for the current QIDI Studio job to finish"}};
+        return json{{"ready", true}};
+    });
+    if (!ready.value("ready", false))
+        return ready;
+
+    struct InputFile {
+        std::string file_id;
+        std::string download_url;
+        std::string file_name;
+        std::string mime_type;
+        std::string extension;
+    };
+    std::vector<InputFile> inputs;
+    inputs.reserve(args["files"].size());
+    for (const json& file : args["files"]) {
+        if (!file.is_object())
+            return {{"error", "Every files entry must be a ChatGPT file object"}};
+        const std::string file_id = file.value("file_id", "");
+        const std::string download_url = file.value("download_url", "");
+        if (file_id.empty() || download_url.empty())
+            return {{"error", "Every attached file requires file_id and download_url"}};
+        if (file_id.size() > 256 || download_url.size() > 16384)
+            return {{"error", "An attached file identifier or URL is unexpectedly long"}};
+        if (!trusted_attached_file_url(download_url))
+            return {{"error", "The attached model URL is not a trusted ChatGPT/OpenAI HTTPS file URL"}};
+        const std::string extension = attached_model_extension(file);
+        if (extension.empty())
+            return {{"error", "Unsupported or missing model extension; use STL, 3MF, OBJ, AMF, STEP, STP, or PLY"},
+                    {"file_id", file_id}};
+        inputs.push_back({file_id, download_url, file.value("file_name", ""),
+                          file.value("mime_type", ""), extension});
+    }
+
+    const boost::filesystem::path inbox = attached_model_inbox();
+    boost::system::error_code ec;
+    boost::filesystem::create_directories(inbox, ec);
+    if (ec)
+        return {{"error", "QIDI Studio could not create its local model-inbox directory"}};
+    cleanup_stale_attached_model_directories(inbox);
+
+    const boost::filesystem::path request_directory = inbox / ("request-" + random_hex_id(16));
+    boost::filesystem::create_directory(request_directory, ec);
+    if (ec)
+        return {{"error", "QIDI Studio could not create a temporary attachment directory"}};
+    ScopedAttachedModelDirectory cleanup(request_directory);
+
+    std::vector<std::string> local_paths;
+    local_paths.reserve(inputs.size());
+    json downloaded_files = json::array();
+    std::size_t total_bytes = 0;
+    for (std::size_t index = 0; index < inputs.size(); ++index) {
+        const InputFile& input = inputs[index];
+        std::string safe_name = safe_attached_model_name(args["files"][index], index, input.extension);
+        boost::filesystem::path final_path = request_directory / safe_name;
+        if (boost::filesystem::exists(final_path)) {
+            safe_name = std::to_string(index + 1) + "_" + safe_name;
+            final_path = request_directory / safe_name;
+        }
+        const boost::filesystem::path partial_path(final_path.string() + ".partial");
+        const AttachedDownloadResult download = download_attached_model(input.download_url, partial_path);
+        if (!download.downloaded) {
+            boost::filesystem::remove(partial_path, ec);
+            json error = {{"error", download.error}, {"file_id", input.file_id},
+                          {"http_status", download.http_status > 0 ? json(download.http_status) : json(nullptr)}};
+            return error;
+        }
+        if (total_bytes > MAX_ATTACHED_MODEL_TOTAL_BYTES ||
+            download.bytes > MAX_ATTACHED_MODEL_TOTAL_BYTES - total_bytes) {
+            boost::filesystem::remove(partial_path, ec);
+            return {{"error", "Attached models exceed the 512 MiB total limit"}};
+        }
+        total_bytes += download.bytes;
+        ec.clear();
+        boost::filesystem::rename(partial_path, final_path, ec);
+        if (ec)
+            return {{"error", "QIDI Studio could not finalize a downloaded attachment"},
+                    {"file_id", input.file_id}};
+        local_paths.push_back(final_path.string());
+        downloaded_files.push_back({{"file_id", input.file_id},
+                                    {"file_name", input.file_name.empty() ? json(safe_name) : json(input.file_name)},
+                                    {"mime_type", input.mime_type.empty() ? json(nullptr) : json(input.mime_type)},
+                                    {"bytes", download.bytes}, {"extension", input.extension}});
+    }
+
+    json import = import_model({{"paths", local_paths}, {"arrange", args.value("arrange", false)}});
+    const bool temporary_files_removed = cleanup.remove();
+    if (import.contains("error")) {
+        import["downloaded_files"] = std::move(downloaded_files);
+        import["temporary_files_removed"] = temporary_files_removed;
+        return import;
+    }
+    import["source"] = "chatgpt_file_params";
+    import["downloaded_files"] = std::move(downloaded_files);
+    import["downloaded_bytes"] = total_bytes;
+    import["temporary_files_removed"] = temporary_files_removed;
+    import["next_recommended_tools"] = json::array({"list_objects", "get_model_diagnostics",
+                                                     "analyze_printability"});
+    return import;
+}
+
 json import_model(const json& args)
 {
     if (!args.contains("paths") || !args["paths"].is_array() || args["paths"].empty())
@@ -3695,7 +4117,9 @@ json list_slice_settings(const json& args)
         json settings = json::array();
         for (size_t i = begin; i < end; ++i) {
             const ConfigOption* option = config->option(keys[i]);
-            if (option != nullptr) settings.push_back({{"key", keys[i]}, {"value", option->serialize()}});
+            if (option != nullptr)
+                settings.push_back({{"key", keys[i]},
+                                    {"value", serialize_config_option(keys[i], option)}});
         }
         return json{{"scope", scope}, {"count", keys.size()}, {"offset", begin},
                     {"returned", end - begin}, {"settings", std::move(settings)}};
@@ -3920,7 +4344,7 @@ json get_slice_settings(const json& args)
                 const ConfigOption* option = preset->config.option(key);
                 if (option == nullptr)
                     throw std::runtime_error("Unknown setting for filament: " + key);
-                values[key] = option->serialize();
+                values[key] = serialize_config_option(key, option);
             }
 
             return json{
@@ -3939,7 +4363,7 @@ json get_slice_settings(const json& args)
             const ConfigOption* option = config->option(key);
             if (option == nullptr)
                 throw std::runtime_error("Unknown setting for " + scope + ": " + key);
-            values[key] = option->serialize();
+            values[key] = serialize_config_option(key, option);
         }
         return json{{"scope", scope}, {"values", std::move(values)}};
     });
@@ -3962,13 +4386,15 @@ json set_slice_settings(const json& args)
                 throw std::runtime_error("Setting values must use QIDI's serialized string format");
             if (updated.option(it.key()) == nullptr)
                 throw std::runtime_error("Unknown setting for " + scope + ": " + it.key());
+            repair_config_option_enum_map(it.key(), updated.option(it.key()));
             updated.set_deserialize_strict(it.key(), it.value().get<std::string>());
         }
         tab->load_config(updated);
 
         json applied = json::object();
         for (auto it = values.begin(); it != values.end(); ++it)
-            applied[it.key()] = tab->get_config()->option(it.key())->serialize();
+            applied[it.key()] = serialize_config_option(
+                it.key(), tab->get_config()->option(it.key()));
         return json{{"scope", scope}, {"applied", std::move(applied)}};
     });
 }
@@ -4000,7 +4426,7 @@ json reset_slice_settings(const json& args)
             if (saved_option == nullptr)
                 throw std::runtime_error("The saved preset has no value for " + scope + " setting: " + key);
             updated.set_key_value(key, saved_option->clone());
-            reset[key] = saved_option->serialize();
+            reset[key] = serialize_config_option(key, saved_option);
         }
         tab->load_config(updated);
         return json{{"scope", scope}, {"preset", saved.name}, {"reset", std::move(reset)}};
@@ -4547,7 +4973,7 @@ json export_gcode(const json& args)
 json get_suite_capabilities()
 {
     return {
-        {"suite_version", "1.9.1"},
+        {"suite_version", "1.10.0"},
         {"qidi_target", "2.7.2.10"},
         {"capability_tiers", {
             {"native", json::array({
@@ -4560,7 +4986,8 @@ json get_suite_capabilities()
                 "printer_monitoring_snapshot", "printer_case_light_control",
                 "adaptive_layer_height_profiles", "geometric_surface_selection",
                 "painted_support_facets", "painted_seam_facets",
-                "native_setting_definitions", "non_mutating_settings_update_preview"
+                "native_setting_definitions", "non_mutating_settings_update_preview",
+                "chatgpt_attachment_model_import"
             })},
             {"computed", json::array({
                 "mesh_diagnostics", "overhang_and_contact_estimates", "orientation_candidates",
@@ -4569,7 +4996,8 @@ json get_suite_capabilities()
             })},
             {"agent_orchestrated", json::array({
                 "comparative_orientation_slicing", "process_variant_comparison",
-                "filament_recommendation", "guided_calibration", "prepare_for_print_workflow"
+                "filament_recommendation", "guided_calibration", "prepare_for_print_workflow",
+                "end_to_end_conversational_print_pipeline"
             })},
             {"not_safely_exposed", json::array({
                 "freehand_painter_brush_stroke_replay", "surface_distance_clearance_map",
@@ -4588,6 +5016,11 @@ json get_suite_capabilities()
             {"surface_selection_previews_never_mutate", true},
             {"settings_update_previews_never_mutate", true},
             {"surface_paint_mutations_are_undoable", true},
+            {"attachment_download_https_only", true},
+            {"attachment_downloads_use_no_qidi_auth_headers", true},
+            {"attachment_files_are_ephemeral", true},
+            {"attachment_file_limit_mib", 256},
+            {"attachment_total_limit_mib", 512},
             {"tunnel_credentials_never_returned", true},
             {"gui_call_timeout_seconds", 30}
         }}
@@ -4773,8 +5206,10 @@ json preview_profile_changes(const json& args)
                 throw std::runtime_error("Setting values must use QIDI's serialized string format");
             if (updated.option(it.key()) == nullptr)
                 throw std::runtime_error("Unknown setting for " + scope + ": " + it.key());
+            repair_config_option_enum_map(it.key(), updated.option(it.key()));
             updated.set_deserialize_strict(it.key(), it.value().get<std::string>());
-            normalized[it.key()] = updated.option(it.key())->serialize();
+            normalized[it.key()] = serialize_config_option(
+                it.key(), updated.option(it.key()));
         }
         return json{{"scope", scope}, {"base_preset", base->name},
                     {"normalized_values", std::move(normalized)}, {"mutated", false}};
@@ -4814,6 +5249,7 @@ json create_profile_variant(const json& args)
                 throw std::runtime_error("Setting values must use QIDI's serialized string format");
             if (updated.option(it.key()) == nullptr)
                 throw std::runtime_error("Unknown setting for " + scope + ": " + it.key());
+            repair_config_option_enum_map(it.key(), updated.option(it.key()));
             updated.set_deserialize_strict(it.key(), it.value().get<std::string>());
         }
         tab->load_config(updated);
@@ -5686,7 +6122,7 @@ json prepare_print_job(QDSDeviceManager* manager, const json& args)
         DynamicPrintConfig full = bundle->full_config();
         const auto setting = [&full](const char* key) -> json {
             const ConfigOption* option = full.option(key);
-            return option != nullptr ? json(option->serialize()) : json(nullptr);
+            return option != nullptr ? json(serialize_config_option(key, option)) : json(nullptr);
         };
         json summary{
             {"project", {{"name", into_u8(plater->get_project_name())},
@@ -6174,6 +6610,23 @@ json tools_list()
         {{"object_id", integer_id}, {"volume_id", integer_id}, {"instance_id", integer_id},
          {"selector", surface_selector}, {"state", paint_state}},
         {"object_id", "volume_id", "selector", "state"}));
+    json import_attached_models_tool = tool_definition("import_attached_models",
+        "Download one or more user-attached ChatGPT model files through authorized temporary file URLs, import them into the current project with QIDI's native loader, and remove the temporary local copies. Supports STL, 3MF, OBJ, AMF, STEP, STP, and PLY.",
+        {{"files", {{"type", "array"}, {"minItems", 1}, {"maxItems", MAX_ATTACHED_MODEL_FILES},
+                    {"items", {{"type", "object"},
+                               {"properties", {{"download_url", {{"type", "string"}}},
+                                               {"file_id", {{"type", "string"}}},
+                                               {"mime_type", {{"type", "string"}}},
+                                               {"file_name", {{"type", "string"}}}}},
+                               {"required", json::array({"download_url", "file_id"})},
+                               {"additionalProperties", false}}}}},
+         {"arrange", {{"type", "boolean"}, {"default", false}}}}, {"files"});
+    import_attached_models_tool["annotations"] = {
+        {"readOnlyHint", false}, {"destructiveHint", false},
+        {"openWorldHint", true}, {"idempotentHint", false}
+    };
+    import_attached_models_tool["_meta"] = {{"openai/fileParams", json::array({"files"})}};
+    tools.push_back(std::move(import_attached_models_tool));
     tools.push_back(tool_definition("import_model",
         "Import one or more model files into the current project.",
         {{"paths", {{"type", "array"}, {"minItems", 1}, {"items", {{"type", "string"}}}}},
@@ -6488,7 +6941,7 @@ json handle_rpc(QDSDeviceManager* manager, const json& request)
             {"result", {
                 {"protocolVersion", "2025-06-18"},
                 {"capabilities", {{"tools", {{"listChanged", false}}}}},
-                {"serverInfo", {{"name", "qidi-studio"}, {"version", "1.9.1"}}}
+                {"serverInfo", {{"name", "qidi-studio"}, {"version", "1.10.0"}}}
             }}
         };
     }
@@ -6589,6 +7042,8 @@ json handle_rpc(QDSDeviceManager* manager, const json& request)
             payload = get_seam_paint_state(arguments);
         else if (tool_name == "set_seam_paint")
             payload = set_seam_paint(arguments);
+        else if (tool_name == "import_attached_models")
+            payload = import_attached_models(arguments);
         else if (tool_name == "import_model")
             payload = import_model(arguments);
         else if (tool_name == "list_presets")

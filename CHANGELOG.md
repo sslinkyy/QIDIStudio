@@ -1,5 +1,20 @@
 # QIDI Studio MCP Changelog
 
+## v1.10.0
+
+- Status: Windows x64 build and live acceptance passed; attachment import, enum serialization, and concurrent-request regression tests completed without HTTP 504. Tool count: 118.
+- Added `import_attached_models` so ChatGPT can pass user-attached STL, 3MF, OBJ, AMF, STEP, STP, or PLY files directly to QIDI Studio using the official `_meta["openai/fileParams"]` contract.
+- Streamed attachments into a randomized per-request directory under the current user's QIDI Studio MCP application-data directory, imported them with QIDI's native model loader, and removed the temporary files after the import attempt.
+- Preserved `import_model` for models that already exist on the QIDI Studio computer.
+- Restricted attachment ingestion to trusted ChatGPT/OpenAI HTTPS file hosts, disabled redirects, limited each file to 256 MiB and each request to 512 MiB, and retained no download URL or local staging path in tool results.
+- Kept QIDI global HTTP headers and tunnel credentials out of attachment requests by using an isolated libcurl download path.
+- Added stale-request cleanup for staging directories left by an interrupted process.
+- Extended native and agent-orchestrated capability reporting for attachment import and the end-to-end conversational print pipeline.
+- Passed the first live ChatGPT attachment import with a 608-bearing STL: the 22 x 22 x 7 mm model downloaded, imported, arranged, and remained available for mesh and printability analysis without slicing.
+- Repaired missing QIDI enum serialization maps on temporary MCP option copies before reading, previewing, changing, fingerprinting, or reporting settings, preventing the observed `ConfigOptionEnumsGenericTempl::serialize()` access violation without mutating active settings during reads or previews.
+- Made overlapping GUI-backed MCP calls fail fast with retryable `GUI_BUSY` metadata instead of waiting behind the active request until the tunnel returns HTTP 504; a full 23-setting non-mutating preview passed afterward with all four QIDI Box slots and the external filament slot active.
+- Updated MCP `serverInfo.version` and `get_suite_capabilities().suite_version` to `1.10.0`.
+
 ## v1.9.1
 
 - Status: source patch ready for Windows x64 build and live acceptance. Tool count: 117.
