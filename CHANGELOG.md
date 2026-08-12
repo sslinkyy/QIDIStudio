@@ -1,4 +1,4 @@
-﻿# QIDI Studio MCP Changelog
+# QIDI Studio MCP Changelog
 
 ## v1.10.0
 
@@ -261,7 +261,7 @@ Status: source patch prepared; Windows build and live validation pending. Tool c
 
 - Preparation refuses every consolidated preflight blocker, including unsafe CoreXY sequential object order or placement.
 - Start rechecks printer readiness, active plate identity, the locked fingerprint, current preflight, and packaged-file existence before upload.
-- Confirmation tokens expire after 60â€“1800 seconds, default to 600 seconds, and are consumed before packaging to prevent concurrent reuse.
+- Confirmation tokens expire after 60–1800 seconds, default to 600 seconds, and are consumed before packaging to prevent concurrent reuse.
 - The upload runs asynchronously and does not expose the temporary package path, printer address, tunnel credentials, or provider credentials.
 - Automatic camera-based cancellation remains excluded; the existing cancel command still requires separate explicit confirmation.
 
