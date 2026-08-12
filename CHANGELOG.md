@@ -13,6 +13,7 @@
 - Passed the first live ChatGPT attachment import with a 608-bearing STL: the 22 x 22 x 7 mm model downloaded, imported, arranged, and remained available for mesh and printability analysis without slicing.
 - Repaired missing QIDI enum serialization maps on temporary MCP option copies before reading, previewing, changing, fingerprinting, or reporting settings, preventing the observed `ConfigOptionEnumsGenericTempl::serialize()` access violation without mutating active settings during reads or previews.
 - Made overlapping GUI-backed MCP calls fail fast with retryable `GUI_BUSY` metadata instead of waiting behind the active request until the tunnel returns HTTP 504; a full 23-setting non-mutating preview passed afterward with all four QIDI Box slots and the external filament slot active.
+- Required guarded direct prints to name an explicit QIDI Box slot or external spool, invalidated old slices when object filament assignments change, verified that the valid slice was generated with the matching project filament, locked slot telemetry into the confirmation token, applied QIDI's native `enable_box`/`value_tN` mapping commands before upload, and required matching physical-slot telemetry before reporting acceptance or printing as confirmed. Multi-filament direct starts remain blocked pending complete per-filament mapping support.
 - Updated MCP `serverInfo.version` and `get_suite_capabilities().suite_version` to `1.10.0`.
 
 ## v1.9.1
