@@ -6511,22 +6511,49 @@ json get_print_job_status(QDSDeviceManager* manager, const json& args)
     }
 
     std::shared_ptr<QDSDevice> device = manager->getDevice(job->device_id);
+    bool matching_job_reported = false;
+    bool filament_source_confirmed = false;
+    bool filament_source_verification_pending = false;
+    bool filament_source_mismatch = false;
+    std::string reported_slot;
     if (device) {
         const std::string state = lower_copy(device->m_print_state + " " + device->m_status);
-        const bool busy = state.find("print") != std::string::npos ||
-                          state.find("pause") != std::string::npos ||
-                          state.find("prepare") != std::string::npos;
-        const bool matching = print_filename_matches(job->upload_name, device->m_print_filename);
+        const bool printing_or_paused = state.find("print") != std::string::npos ||
+                                        state.find("pause") != std::string::npos;
+        const bool preparing = state.find("prepare") != std::string::npos;
+        const bool busy = printing_or_paused || preparing;
+        matching_job_reported = print_filename_matches(job->upload_name, device->m_print_filename);
+        reported_slot = lower_copy(device->m_cur_slot);
+        const std::string expected_slot = "slot" + std::to_string(job->physical_slot_id);
+        const std::string expected_slot_with_separator = "slot-" + std::to_string(job->physical_slot_id);
+        filament_source_confirmed = !reported_slot.empty() &&
+            (reported_slot == expected_slot || reported_slot == expected_slot_with_separator);
+        // m_cur_slot describes the filament physically loaded in the toolhead, not
+        // merely the mapping selected for the queued job.  During heating, homing,
+        // and Box unload/load it legitimately continues to report the prior slot.
+        // Treat that as pending until the first print layer begins.
+        const bool first_layer_started = device->m_print_cur_layer > 0;
+        filament_source_verification_pending = matching_job_reported && busy &&
+            !filament_source_confirmed && !first_layer_started;
+        filament_source_mismatch = matching_job_reported && busy &&
+            !filament_source_confirmed && first_layer_started;
         std::lock_guard<std::mutex> lock(print_job_mutex());
         if (job->stage != "failed") {
-            if (matching && busy) {
-                job->stage = "printing";
-                job->updated_at = std::chrono::system_clock::now();
-            } else if (matching && job->stage == "uploaded_awaiting_printer") {
-                job->stage = "printer_accepted";
-                job->updated_at = std::chrono::system_clock::now();
-            } else if (job->stage == "printing" && !busy) {
-                job->stage = "completed_or_stopped";
+            std::string next_stage;
+            if (filament_source_mismatch)
+                next_stage = "filament_source_mismatch";
+            else if (matching_job_reported && busy && filament_source_confirmed)
+                next_stage = printing_or_paused ? "printing" : "printer_preparing";
+            else if (filament_source_verification_pending)
+                next_stage = "awaiting_filament_source";
+            else if (matching_job_reported && job->stage == "uploaded_awaiting_printer")
+                next_stage = "printer_accepted";
+            else if ((job->stage == "printing" || job->stage == "printer_preparing" ||
+                      job->stage == "awaiting_filament_source" ||
+                      job->stage == "filament_source_mismatch") && !busy)
+                next_stage = "completed_or_stopped";
+            if (!next_stage.empty() && next_stage != job->stage) {
+                job->stage = std::move(next_stage);
                 job->updated_at = std::chrono::system_clock::now();
             } else if (job->stage == "uploaded_awaiting_printer" &&
                        std::chrono::system_clock::now() - job->updated_at > std::chrono::minutes(10)) {
@@ -6538,14 +6565,6 @@ json get_print_job_status(QDSDeviceManager* manager, const json& args)
     }
 
     std::lock_guard<std::mutex> lock(print_job_mutex());
-    const bool matching_job_reported = job->stage == "printer_accepted" || job->stage == "printing" ||
-                                       job->stage == "completed_or_stopped";
-    const std::string reported_slot = device ? lower_copy(device->m_cur_slot) : std::string();
-    const std::string expected_slot = "slot" + std::to_string(job->physical_slot_id);
-    const std::string expected_slot_with_separator = "slot-" + std::to_string(job->physical_slot_id);
-    const bool filament_source_confirmed = !reported_slot.empty() &&
-        (reported_slot == expected_slot || reported_slot == expected_slot_with_separator);
-    const bool printing_with_unconfirmed_source = job->stage == "printing" && !filament_source_confirmed;
     return {{"job_id", job->job_id}, {"device_id", job->device_id},
             {"printer_name", job->printer_name}, {"stage", job->stage},
             {"filament_source", {{"project_filament_index", job->project_filament_index},
@@ -6560,10 +6579,16 @@ json get_print_job_status(QDSDeviceManager* manager, const json& args)
             {"reported_physical_slot", device ? json(device->m_cur_slot) : json(nullptr)},
             {"matching_print_job_reported", matching_job_reported},
             {"physical_filament_source_confirmed", filament_source_confirmed},
+            {"physical_filament_source_verification_pending", filament_source_verification_pending},
+            {"physical_filament_source_mismatch", filament_source_mismatch},
             {"printer_acceptance_confirmed", matching_job_reported && filament_source_confirmed},
             {"printing_confirmed", job->stage == "printing" && filament_source_confirmed},
-            {"filament_source_warning", printing_with_unconfirmed_source
-                ? json("The printer reports the matching job as active, but has not confirmed the selected physical filament slot")
+            {"cancel_recommended", filament_source_mismatch},
+            {"filament_source_status", filament_source_confirmed ? "confirmed" :
+                (filament_source_mismatch ? "mismatch" :
+                 (filament_source_verification_pending ? "pending_physical_load" : "unavailable"))},
+            {"filament_source_warning", filament_source_mismatch
+                ? json("The first print layer began without confirmation of the selected physical filament slot; cancel the print")
                 : json(nullptr)},
             {"error", job->error.empty() ? json(nullptr) : json(job->error)},
             {"created_at_utc", utc_time_string(job->created_at)},
@@ -7106,7 +7131,7 @@ json tools_list()
          {"confirm", {{"type", "boolean"}, {"default", false}}}},
         {"confirmation_token", "confirm"}));
     tools.push_back(tool_definition("get_print_job_status",
-        "Report native packaging/upload state and confirm printer acceptance or printing only when telemetry reports both the matching filename and the locked physical filament slot.",
+        "Report native packaging/upload state and confirm printer acceptance or printing only when telemetry reports both the matching filename and locked physical filament slot. A prior toolhead slot remains pending during layer-zero preparation; cancel is recommended only if the first layer begins with a mismatched slot.",
         {{"job_id", {{"type", "string"}, {"minLength", 1}}}}, {"job_id"}));
     return {{"tools", std::move(tools)}};
 }
