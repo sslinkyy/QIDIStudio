@@ -90,6 +90,12 @@ struct PreparedPrintJob {
     int plate_index{-1};
     bool bed_leveling{false};
     bool timelapse{false};
+    int project_filament_index{-1};
+    int physical_slot_id{-1};
+    bool use_qidi_box{false};
+    std::string project_filament_preset;
+    std::string physical_filament_type;
+    std::string physical_filament_color;
     bool used{false};
     std::chrono::system_clock::time_point created_at;
     std::chrono::system_clock::time_point expires_at;
@@ -105,6 +111,12 @@ struct ActivePrintJob {
     int upload_progress_percent{0};
     bool bed_leveling{false};
     bool timelapse{false};
+    int project_filament_index{-1};
+    int physical_slot_id{-1};
+    bool use_qidi_box{false};
+    std::string project_filament_preset;
+    std::string physical_filament_type;
+    std::string physical_filament_color;
     std::chrono::system_clock::time_point created_at;
     std::chrono::system_clock::time_point updated_at;
 };
@@ -4704,10 +4716,12 @@ json set_object_extruder(const json& args)
         ObjectList* object_list = wxGetApp().obj_list();
         if (object_list != nullptr)
             object_list->update_filament_values_for_items(filament_count);
-        plater->update();
+        plater->changed_object(object_id);
         plater->object_list_changed();
         return json{{"object_id", object_id}, {"extruder", object->config.extruder()},
-                    {"filament_preset", bundle->filament_presets[static_cast<size_t>(extruder - 1)]}};
+                    {"project_filament_index", extruder - 1},
+                    {"filament_preset", bundle->filament_presets[static_cast<size_t>(extruder - 1)]},
+                    {"reslice_required", true}};
     });
 }
 
@@ -4735,7 +4749,9 @@ json set_volume_extruder(const json& args)
         plater->changed_object(object_id);
         plater->object_list_changed();
         return json{{"object_id", object_id}, {"volume_id", volume_id}, {"extruder", extruder},
-                    {"filament_preset", bundle->filament_presets[static_cast<size_t>(extruder - 1)]}};
+                    {"project_filament_index", extruder - 1},
+                    {"filament_preset", bundle->filament_presets[static_cast<size_t>(extruder - 1)]},
+                    {"reslice_required", true}};
     });
 }
 
@@ -5011,6 +5027,10 @@ json get_suite_capabilities()
             {"explicit_confirmation_for_cancel_or_delete", true},
             {"start_print_requires_confirmation_token", true},
             {"print_confirmation_tokens_single_use", true},
+            {"direct_print_requires_explicit_physical_filament_source", true},
+            {"direct_print_verifies_slice_filament_matches_source", true},
+            {"direct_print_locks_qidi_box_slot_telemetry", true},
+            {"direct_print_confirms_reported_physical_slot", true},
             {"camera_light_enabled_before_capture", true},
             {"monitoring_never_controls_print", true},
             {"surface_selection_previews_never_mutate", true},
@@ -5861,12 +5881,17 @@ json get_printer_details(QDSDeviceManager* manager, const json& args)
     json slots = json::array();
     const size_t slot_count = std::max({device->m_filament_type.size(), device->m_filament_colors.size(),
                                         device->m_slot_state.size(), device->m_slot_id.size()});
-    for (size_t index = 0; index < slot_count; ++index)
+    for (size_t index = 0; index < slot_count; ++index) {
+        const bool external = index == 16;
         slots.push_back({{"index", index},
+            {"source", external ? "external" : "qidi_box"},
+            {"box_index", !external ? json(index / 4) : json(nullptr)},
+            {"box_slot_index", !external ? json(index % 4) : json(nullptr)},
             {"slot_id", index < device->m_slot_id.size() ? json(device->m_slot_id[index]) : json(nullptr)},
             {"state", index < device->m_slot_state.size() ? json(device->m_slot_state[index]) : json(nullptr)},
             {"type", index < device->m_filament_type.size() ? json(device->m_filament_type[index]) : json(nullptr)},
             {"color", index < device->m_filament_colors.size() ? json(device->m_filament_colors[index]) : json(nullptr)}});
+    }
     return {{"device_id", device->m_id}, {"name", device->m_name}, {"ip", device->m_ip},
             {"online", device->is_online()}, {"selected", device->is_selected.load()},
             {"status", device->m_status}, {"print_state", device->m_print_state},
@@ -5880,6 +5905,9 @@ json get_printer_details(QDSDeviceManager* manager, const json& args)
                       {"chamber", device->m_chamber_fan_speed}}},
             {"case_light", device->m_case_light}, {"filament_sensor", device->m_extruder_filament},
             {"reported_nozzle_diameters_mm", device->m_nozzle_diameter},
+            {"qidi_box_count", device->m_box_count},
+            {"current_physical_slot", device->m_cur_slot},
+            {"external_physical_slot_id", 16},
             {"filament_slots", std::move(slots)},
             {"camera", {{"device_url", device->m_url}, {"current_print_image_url", device->m_print_png_url},
                         {"image_available", !device->m_print_png_url.empty()}}}};
@@ -6087,6 +6115,32 @@ json prepare_print_job(QDSDeviceManager* manager, const json& args)
         return {{"error", "bed_leveling and timelapse must be booleans"}};
     const bool bed_leveling = args.value("bed_leveling", false);
     const bool timelapse = args.value("timelapse", false);
+    if (!args.contains("filament_source") || !args["filament_source"].is_object())
+        return {{"prepared", false}, {"error_code", "FILAMENT_SELECTION_REQUIRED"},
+                {"error", "Choose the physical filament source before slicing and provide filament_source"}};
+    const json& filament_source = args["filament_source"];
+    if (!filament_source.contains("project_filament_index") ||
+        !filament_source["project_filament_index"].is_number_integer())
+        return {{"prepared", false}, {"error", "filament_source.project_filament_index must be a non-negative integer"}};
+    const int project_filament_index = filament_source["project_filament_index"].get<int>();
+    if (project_filament_index < 0)
+        return {{"prepared", false}, {"error", "filament_source.project_filament_index must be non-negative"}};
+    const std::string source = filament_source.value("source", "");
+    if (source != "qidi_box" && source != "external")
+        return {{"prepared", false}, {"error", "filament_source.source must be qidi_box or external"}};
+    const bool use_qidi_box = source == "qidi_box";
+    int physical_slot_id = 16;
+    if (use_qidi_box) {
+        if (!filament_source.contains("slot_id") || !filament_source["slot_id"].is_number_integer())
+            return {{"prepared", false}, {"error", "filament_source.slot_id is required for qidi_box"}};
+        physical_slot_id = filament_source["slot_id"].get<int>();
+        if (physical_slot_id < 0 || physical_slot_id > 15)
+            return {{"prepared", false}, {"error", "QIDI Box slot_id must be between 0 and 15"}};
+    } else if (filament_source.contains("slot_id") &&
+               (!filament_source["slot_id"].is_number_integer() ||
+                filament_source["slot_id"].get<int>() != 16)) {
+        return {{"prepared", false}, {"error", "The external source uses physical slot_id 16"}};
+    }
     const int requested_ttl = args.value("expires_in_seconds", static_cast<int>(PRINT_TOKEN_DEFAULT_TTL.count()));
     if (requested_ttl < 60 || requested_ttl > static_cast<int>(PRINT_TOKEN_MAX_TTL.count()))
         return {{"error", "expires_in_seconds must be between 60 and 1800"}};
@@ -6102,7 +6156,22 @@ json prepare_print_job(QDSDeviceManager* manager, const json& args)
         return {{"prepared", false}, {"error", "The selected printer has no local/LAN address"},
                 {"device_id", device_id}};
 
-    json locked = on_gui_thread([bed_leveling, timelapse]() {
+    if (use_qidi_box &&
+        (static_cast<size_t>(physical_slot_id) >= device->m_slot_state.size() ||
+         device->m_slot_state[static_cast<size_t>(physical_slot_id)] == 0))
+        return {{"prepared", false}, {"error_code", "FILAMENT_SLOT_UNAVAILABLE"},
+                {"error", "The selected QIDI Box slot is empty or unavailable"},
+                {"slot_id", physical_slot_id}};
+    const std::string physical_filament_type =
+        static_cast<size_t>(physical_slot_id) < device->m_filament_type.size()
+            ? device->m_filament_type[static_cast<size_t>(physical_slot_id)] : std::string();
+    const std::string physical_filament_color =
+        static_cast<size_t>(physical_slot_id) < device->m_filament_colors.size()
+            ? device->m_filament_colors[static_cast<size_t>(physical_slot_id)] : std::string();
+
+    json locked = on_gui_thread([bed_leveling, timelapse, project_filament_index,
+                                 use_qidi_box, physical_slot_id,
+                                 physical_filament_type, physical_filament_color]() {
         Plater* plater = require_plater();
         PartPlate* plate = require_plate(plater);
         json preflight = build_print_preflight_report();
@@ -6116,6 +6185,33 @@ json prepare_print_job(QDSDeviceManager* manager, const json& args)
             return json{{"prepared", false},
                         {"error", "v1.3 requires the selected QIDI printer preset to support native .gcode.3mf packaging"},
                         {"preflight", std::move(preflight)}};
+
+        if (static_cast<size_t>(project_filament_index) >= bundle->filament_presets.size())
+            return json{{"prepared", false}, {"error_code", "FILAMENT_SELECTION_INVALID"},
+                        {"error", "The selected project filament index is out of range"},
+                        {"project_filament_index", project_filament_index},
+                        {"project_filament_count", bundle->filament_presets.size()}};
+        GCodeProcessorResult* slice_result = plate->get_slice_result();
+        if (slice_result == nullptr)
+            return json{{"prepared", false}, {"error", "The active plate has no slice result"}};
+        std::vector<size_t> used_filaments;
+        {
+            std::lock_guard<std::mutex> lock(slice_result->result_mutex);
+            for (const auto& entry : slice_result->print_statistics.total_volumes_per_extruder)
+                if (entry.second > 0.0)
+                    used_filaments.push_back(entry.first);
+        }
+        if (used_filaments.size() != 1)
+            return json{{"prepared", false}, {"error_code", "MULTI_FILAMENT_DIRECT_PRINT_UNSUPPORTED"},
+                        {"error", "Guarded direct printing currently requires exactly one sliced project filament; use QIDI's native send dialog for multi-filament mapping"},
+                        {"used_project_filament_indices", used_filaments}};
+        if (used_filaments.front() != static_cast<size_t>(project_filament_index))
+            return json{{"prepared", false}, {"error_code", "RESLICE_WITH_SELECTED_FILAMENT"},
+                        {"error", "The active slice was not generated with the selected project filament; assign that filament to the model and slice again"},
+                        {"selected_project_filament_index", project_filament_index},
+                        {"sliced_project_filament_index", used_filaments.front()}};
+        const std::string project_filament_preset =
+            bundle->filament_presets[static_cast<size_t>(project_filament_index)];
 
         const PrintStatistics& stats =
             plater->get_partplate_list().get_current_fff_print().print_statistics();
@@ -6143,8 +6239,14 @@ json prepare_print_job(QDSDeviceManager* manager, const json& args)
                           {"brim_type", setting("brim_type")},
                           {"raft_layers", setting("raft_layers")}}},
             {"printer_options", {{"bed_leveling", bed_leveling}, {"timelapse", timelapse}}},
+            {"filament_source", {{"project_filament_index", project_filament_index},
+                                 {"project_filament_preset", project_filament_preset},
+                                 {"source", use_qidi_box ? "qidi_box" : "external"},
+                                 {"physical_slot_id", physical_slot_id},
+                                 {"physical_filament_type", physical_filament_type.empty() ? json(nullptr) : json(physical_filament_type)},
+                                 {"physical_filament_color", physical_filament_color.empty() ? json(nullptr) : json(physical_filament_color)}}},
             {"physical_checks_required", json::array({"build_plate_installed_clean_and_empty",
-                                                       "correct_filament_loaded",
+                                                       "selected_physical_filament_matches_summary",
                                                        "sufficient_filament_remaining",
                                                        "no_obstruction_in_toolhead_path"})}
         };
@@ -6166,6 +6268,13 @@ json prepare_print_job(QDSDeviceManager* manager, const json& args)
     prepared.plate_index = locked.value("plate_index", -1);
     prepared.bed_leveling = bed_leveling;
     prepared.timelapse = timelapse;
+    prepared.project_filament_index = project_filament_index;
+    prepared.physical_slot_id = physical_slot_id;
+    prepared.use_qidi_box = use_qidi_box;
+    prepared.project_filament_preset =
+        locked["summary"]["filament_source"].value("project_filament_preset", "");
+    prepared.physical_filament_type = physical_filament_type;
+    prepared.physical_filament_color = physical_filament_color;
     prepared.created_at = now;
     prepared.expires_at = now + std::chrono::seconds(requested_ttl);
     {
@@ -6222,6 +6331,12 @@ json start_print_job(QDSDeviceManager* manager, const json& args)
         active->upload_name = prepared.upload_name;
         active->bed_leveling = prepared.bed_leveling;
         active->timelapse = prepared.timelapse;
+        active->project_filament_index = prepared.project_filament_index;
+        active->physical_slot_id = prepared.physical_slot_id;
+        active->use_qidi_box = prepared.use_qidi_box;
+        active->project_filament_preset = prepared.project_filament_preset;
+        active->physical_filament_type = prepared.physical_filament_type;
+        active->physical_filament_color = prepared.physical_filament_color;
         active->created_at = active->updated_at = now;
         active_print_jobs()[active->job_id] = active;
     }
@@ -6236,6 +6351,29 @@ json start_print_job(QDSDeviceManager* manager, const json& args)
         update_active_job(active, "failed", "Printer is not ready for a new job");
         return {{"accepted", false}, {"job_id", active->job_id}, {"error", active->error},
                 {"printer", std::move(readiness)}};
+    }
+    if (prepared.use_qidi_box) {
+        const size_t slot = static_cast<size_t>(prepared.physical_slot_id);
+        if (slot >= device->m_slot_state.size() || device->m_slot_state[slot] == 0) {
+            update_active_job(active, "failed", "The selected QIDI Box slot became empty or unavailable");
+            return {{"accepted", false}, {"job_id", active->job_id},
+                    {"error_code", "FILAMENT_SLOT_UNAVAILABLE"}, {"error", active->error}};
+        }
+        const std::string current_type = slot < device->m_filament_type.size()
+            ? device->m_filament_type[slot] : std::string();
+        const std::string current_color = slot < device->m_filament_colors.size()
+            ? device->m_filament_colors[slot] : std::string();
+        if ((!prepared.physical_filament_type.empty() &&
+             current_type != prepared.physical_filament_type) ||
+            (!prepared.physical_filament_color.empty() &&
+             current_color != prepared.physical_filament_color)) {
+            update_active_job(active, "failed", "The selected QIDI Box filament changed after print preparation");
+            return {{"accepted", false}, {"job_id", active->job_id},
+                    {"error_code", "FILAMENT_SLOT_CHANGED"}, {"error", active->error},
+                    {"expected", {{"type", prepared.physical_filament_type},
+                                  {"color", prepared.physical_filament_color}}},
+                    {"current", {{"type", current_type}, {"color", current_color}}}};
+        }
     }
 
     json package = on_gui_thread([prepared]() {
@@ -6287,6 +6425,22 @@ json start_print_job(QDSDeviceManager* manager, const json& args)
                 update_active_job(active, "failed", "Printer is no longer in standby: " + status.first);
                 return;
             }
+            const wxString box_mode_command = active->use_qidi_box
+                ? "SAVE_VARIABLE VARIABLE=enable_box VALUE=1"
+                : "SAVE_VARIABLE VARIABLE=enable_box VALUE=0";
+            if (!upload_job.printhost->send_command_to_printer(status_message, box_mode_command)) {
+                update_active_job(active, "failed", "Printer rejected the physical filament source mode");
+                return;
+            }
+            if (active->use_qidi_box) {
+                const wxString slot_command = wxString::Format(
+                    "SAVE_VARIABLE VARIABLE=value_t%d VALUE=\\\"'slot%d'\\\"",
+                    active->project_filament_index, active->physical_slot_id);
+                if (!upload_job.printhost->send_command_to_printer(status_message, slot_command)) {
+                    update_active_job(active, "failed", "Printer rejected the QIDI Box filament-slot mapping");
+                    return;
+                }
+            }
             const std::string leveling_command = active->bed_leveling ? "G31" : "G32";
             if (!upload_job.printhost->send_command_to_printer(status_message, leveling_command)) {
                 update_active_job(active, "failed", "Printer rejected the bed-leveling option");
@@ -6332,6 +6486,12 @@ json start_print_job(QDSDeviceManager* manager, const json& args)
 
     return {{"accepted", true}, {"job_id", active->job_id},
             {"device_id", active->device_id}, {"printer_name", active->printer_name},
+            {"filament_source", {{"project_filament_index", active->project_filament_index},
+                                 {"project_filament_preset", active->project_filament_preset},
+                                 {"source", active->use_qidi_box ? "qidi_box" : "external"},
+                                 {"physical_slot_id", active->physical_slot_id},
+                                 {"physical_filament_type", active->physical_filament_type.empty() ? json(nullptr) : json(active->physical_filament_type)},
+                                 {"physical_filament_color", active->physical_filament_color.empty() ? json(nullptr) : json(active->physical_filament_color)}}},
             {"expected_filename", active->upload_name}, {"stage", "uploading"},
             {"message", "The native upload/start job was accepted; use get_print_job_status to verify printer acceptance"}};
 }
@@ -6351,22 +6511,49 @@ json get_print_job_status(QDSDeviceManager* manager, const json& args)
     }
 
     std::shared_ptr<QDSDevice> device = manager->getDevice(job->device_id);
+    bool matching_job_reported = false;
+    bool filament_source_confirmed = false;
+    bool filament_source_verification_pending = false;
+    bool filament_source_mismatch = false;
+    std::string reported_slot;
     if (device) {
         const std::string state = lower_copy(device->m_print_state + " " + device->m_status);
-        const bool busy = state.find("print") != std::string::npos ||
-                          state.find("pause") != std::string::npos ||
-                          state.find("prepare") != std::string::npos;
-        const bool matching = print_filename_matches(job->upload_name, device->m_print_filename);
+        const bool printing_or_paused = state.find("print") != std::string::npos ||
+                                        state.find("pause") != std::string::npos;
+        const bool preparing = state.find("prepare") != std::string::npos;
+        const bool busy = printing_or_paused || preparing;
+        matching_job_reported = print_filename_matches(job->upload_name, device->m_print_filename);
+        reported_slot = lower_copy(device->m_cur_slot);
+        const std::string expected_slot = "slot" + std::to_string(job->physical_slot_id);
+        const std::string expected_slot_with_separator = "slot-" + std::to_string(job->physical_slot_id);
+        filament_source_confirmed = !reported_slot.empty() &&
+            (reported_slot == expected_slot || reported_slot == expected_slot_with_separator);
+        // m_cur_slot describes the filament physically loaded in the toolhead, not
+        // merely the mapping selected for the queued job.  During heating, homing,
+        // and Box unload/load it legitimately continues to report the prior slot.
+        // Treat that as pending until the first print layer begins.
+        const bool first_layer_started = device->m_print_cur_layer > 0;
+        filament_source_verification_pending = matching_job_reported && busy &&
+            !filament_source_confirmed && !first_layer_started;
+        filament_source_mismatch = matching_job_reported && busy &&
+            !filament_source_confirmed && first_layer_started;
         std::lock_guard<std::mutex> lock(print_job_mutex());
         if (job->stage != "failed") {
-            if (matching && busy) {
-                job->stage = "printing";
-                job->updated_at = std::chrono::system_clock::now();
-            } else if (matching && job->stage == "uploaded_awaiting_printer") {
-                job->stage = "printer_accepted";
-                job->updated_at = std::chrono::system_clock::now();
-            } else if (job->stage == "printing" && !busy) {
-                job->stage = "completed_or_stopped";
+            std::string next_stage;
+            if (filament_source_mismatch)
+                next_stage = "filament_source_mismatch";
+            else if (matching_job_reported && busy && filament_source_confirmed)
+                next_stage = printing_or_paused ? "printing" : "printer_preparing";
+            else if (filament_source_verification_pending)
+                next_stage = "awaiting_filament_source";
+            else if (matching_job_reported && job->stage == "uploaded_awaiting_printer")
+                next_stage = "printer_accepted";
+            else if ((job->stage == "printing" || job->stage == "printer_preparing" ||
+                      job->stage == "awaiting_filament_source" ||
+                      job->stage == "filament_source_mismatch") && !busy)
+                next_stage = "completed_or_stopped";
+            if (!next_stage.empty() && next_stage != job->stage) {
+                job->stage = std::move(next_stage);
                 job->updated_at = std::chrono::system_clock::now();
             } else if (job->stage == "uploaded_awaiting_printer" &&
                        std::chrono::system_clock::now() - job->updated_at > std::chrono::minutes(10)) {
@@ -6378,15 +6565,31 @@ json get_print_job_status(QDSDeviceManager* manager, const json& args)
     }
 
     std::lock_guard<std::mutex> lock(print_job_mutex());
-    const bool confirmed = job->stage == "printer_accepted" || job->stage == "printing" ||
-                           job->stage == "completed_or_stopped";
     return {{"job_id", job->job_id}, {"device_id", job->device_id},
             {"printer_name", job->printer_name}, {"stage", job->stage},
+            {"filament_source", {{"project_filament_index", job->project_filament_index},
+                                 {"project_filament_preset", job->project_filament_preset},
+                                 {"source", job->use_qidi_box ? "qidi_box" : "external"},
+                                 {"physical_slot_id", job->physical_slot_id},
+                                 {"physical_filament_type", job->physical_filament_type.empty() ? json(nullptr) : json(job->physical_filament_type)},
+                                 {"physical_filament_color", job->physical_filament_color.empty() ? json(nullptr) : json(job->physical_filament_color)}}},
             {"upload_progress_percent", job->upload_progress_percent},
             {"expected_filename", job->upload_name},
             {"reported_filename", device ? json(device->m_print_filename) : json(nullptr)},
-            {"printer_acceptance_confirmed", confirmed},
-            {"printing_confirmed", job->stage == "printing"},
+            {"reported_physical_slot", device ? json(device->m_cur_slot) : json(nullptr)},
+            {"matching_print_job_reported", matching_job_reported},
+            {"physical_filament_source_confirmed", filament_source_confirmed},
+            {"physical_filament_source_verification_pending", filament_source_verification_pending},
+            {"physical_filament_source_mismatch", filament_source_mismatch},
+            {"printer_acceptance_confirmed", matching_job_reported && filament_source_confirmed},
+            {"printing_confirmed", job->stage == "printing" && filament_source_confirmed},
+            {"cancel_recommended", filament_source_mismatch},
+            {"filament_source_status", filament_source_confirmed ? "confirmed" :
+                (filament_source_mismatch ? "mismatch" :
+                 (filament_source_verification_pending ? "pending_physical_load" : "unavailable"))},
+            {"filament_source_warning", filament_source_mismatch
+                ? json("The first print layer began without confirmation of the selected physical filament slot; cancel the print")
+                : json(nullptr)},
             {"error", job->error.empty() ? json(nullptr) : json(job->error)},
             {"created_at_utc", utc_time_string(job->created_at)},
             {"updated_at_utc", utc_time_string(job->updated_at)},
@@ -6697,11 +6900,11 @@ json tools_list()
          {"confirm", {{"type", "boolean"}, {"default", false}}}},
         {"object_id", "volume_id", "confirm"}));
     tools.push_back(tool_definition("set_object_extruder",
-        "Assign a model object to a one-based filament/extruder index loaded in the project.",
+        "Assign a model object to a one-based project filament/extruder index. Before a print slice, ask which physical QIDI Box slot or external spool the user wants, assign its matching project filament here, then reslice.",
         {{"object_id", integer_id},
          {"extruder", {{"type", "integer"}, {"minimum", 1}}}}, {"object_id", "extruder"}));
     tools.push_back(tool_definition("set_volume_extruder",
-        "Assign one multipart-model volume to a one-based filament/extruder index loaded in the project.",
+        "Assign one multipart-model volume to a one-based project filament/extruder index. Before a print slice, ask which physical QIDI Box slot or external spool the user wants, assign its matching project filament here, then reslice.",
         {{"object_id", integer_id}, {"volume_id", integer_id},
          {"extruder", {{"type", "integer"}, {"minimum", 1}}}},
         {"object_id", "volume_id", "extruder"}));
@@ -6719,7 +6922,7 @@ json tools_list()
     tools.push_back(tool_definition("auto_orient",
         "Start QIDI Studio's automatic orientation job."));
     tools.push_back(tool_definition("slice_plate",
-        "Start slicing the active plate."));
+        "Start slicing the active plate. For a print workflow, first ask the user which physical filament source to use and assign the matching project filament/extruder; prepare_print_job will reject a slice made with a different filament."));
     tools.push_back(tool_definition("get_slice_status",
         "Return active-plate slicing progress, result readiness, and broader QIDI Studio job/background activity state."));
     tools.push_back(tool_definition("get_slice_result",
@@ -6875,7 +7078,7 @@ json tools_list()
     tools.push_back(tool_definition("analyze_first_layer",
         "Inspect the valid first-layer toolpath for Z, time, bounds, extrusion, line width, fan, temperature, and flow."));
     tools.push_back(tool_definition("get_printer_details",
-        "Return detailed physical-printer status including nozzle report, temperatures, fans, filament slots, and camera metadata.",
+        "Return detailed physical-printer status including nozzle report, temperatures, fans, explicitly labeled QIDI Box slots 0-15 and external slot 16, the currently loaded physical slot, and camera metadata.",
         {{"device_id", {{"type", "string"}, {"minLength", 1}}}}, {"device_id"}));
     tools.push_back(tool_definition("capture_printer_camera",
         "Turn on the printer case light when needed, wait for exposure, and return the current camera image as MCP image content. The light is left on.",
@@ -6909,19 +7112,26 @@ json tools_list()
         "Run a consolidated model, build-volume, configuration, slice, G-code, sequential-clearance, and optional printer-readiness gate.",
         {{"device_id", {{"type", "string"}}}}));
     tools.push_back(tool_definition("prepare_print_job",
-        "Lock a print-ready active plate, target local/LAN QIDI printer, native print options, preflight, and slice fingerprint into a short-lived single-use confirmation token. This does not upload or print.",
+        "Lock a single-filament print-ready plate, explicit physical QIDI Box/external source, target printer, native options, preflight, and slice fingerprint into a short-lived single-use token. The slice must already use project_filament_index; otherwise assign that filament and reslice. This does not upload or print.",
         {{"device_id", {{"type", "string"}, {"minLength", 1}}},
+         {"filament_source", {{"type", "object"},
+                              {"properties", {{"project_filament_index", integer_id},
+                                              {"source", {{"type", "string"},
+                                                          {"enum", json::array({"qidi_box", "external"})}}},
+                                              {"slot_id", {{"type", "integer"}, {"minimum", 0}, {"maximum", 16}}}}},
+                              {"required", json::array({"project_filament_index", "source"})},
+                              {"additionalProperties", false}}},
          {"bed_leveling", {{"type", "boolean"}, {"default", false}}},
          {"timelapse", {{"type", "boolean"}, {"default", false}}},
          {"expires_in_seconds", {{"type", "integer"}, {"minimum", 60}, {"maximum", 1800}, {"default", 600}}}},
-        {"device_id"}));
+        {"device_id", "filament_source"}));
     tools.push_back(tool_definition("start_print_job",
-        "Consume a prepared confirmation token and use QIDI's native local/LAN .gcode.3mf upload with StartPrint. Requires confirm=true and returns accepted before printing is confirmed.",
+        "Consume a prepared confirmation token, apply its locked physical QIDI Box/external mapping, and use QIDI's native local/LAN .gcode.3mf upload with StartPrint. Requires confirm=true and returns accepted before printing is confirmed.",
         {{"confirmation_token", {{"type", "string"}, {"minLength", 1}}},
          {"confirm", {{"type", "boolean"}, {"default", false}}}},
         {"confirmation_token", "confirm"}));
     tools.push_back(tool_definition("get_print_job_status",
-        "Report native packaging/upload state and confirm printer acceptance or printing only when telemetry reports the matching filename.",
+        "Report native packaging/upload state and confirm printer acceptance or printing only when telemetry reports both the matching filename and locked physical filament slot. A prior toolhead slot remains pending during layer-zero preparation; cancel is recommended only if the first layer begins with a mismatched slot.",
         {{"job_id", {{"type", "string"}, {"minLength", 1}}}}, {"job_id"}));
     return {{"tools", std::move(tools)}};
 }
