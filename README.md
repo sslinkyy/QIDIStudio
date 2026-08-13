@@ -13,8 +13,8 @@ hardware, account, or official QIDI Studio support, use
 
 ## Current release
 
-- MCP integration: **v1.9.0**
-- Advertised tools: **117**
+- MCP integration: **v1.10.0**
+- Advertised tools: **118**
 - QIDI Studio target: **2.7.2.10**
 - Validated platform: **Windows x64, RelWithDebInfo**
 - Local MCP endpoint: `http://127.0.0.1:8765/mcp`
@@ -25,12 +25,12 @@ See [CHANGELOG.md](CHANGELOG.md) for release history and validation details.
 
 | Area | Capabilities |
 | --- | --- |
-| Project and models | Create, load, inspect, transform, arrange, orient, cut, split, merge, repair, and export projects and models. |
+| Project and models | Create, load, import ChatGPT-attached models, inspect, transform, arrange, orient, cut, split, merge, repair, and export projects and models. |
 | Settings | Read and update print, filament, printer, object, and volume settings; inspect native metadata, inheritance, limits, and enum choices; preview proposed updates without mutation. |
 | Slicing | Validate configurations, slice plates, inspect warnings and toolpaths, analyze the first layer, check filament quantity, and export G-code. |
 | Advanced preparation | Adaptive layer height, support and seam facet painting, print-by-object ordering and clearance validation, orientation candidates, and printability analysis. |
 | Printers | Discover printers, inspect capabilities and readiness, monitor jobs, capture camera frames, control the case light, and pause, resume, or cancel jobs. |
-| Print workflow | Run preflight checks and use a confirmation-gated local/LAN print-start workflow. |
+| Print workflow | Select and lock an explicit QIDI Box or external filament source before slicing, run preflight checks, and use a confirmation-gated local/LAN print-start workflow. |
 | Recovery and visibility | Resolve QIDI Studio recovery prompts, inspect UI state, and capture the visible application window. |
 | Connectivity | Manage the Secure MCP Tunnel from QIDI Studio, including setup, status, start, stop, restart, diagnostics, logs, and dashboard access. |
 
@@ -67,7 +67,7 @@ or inspect it. Detailed companion documentation is in
 3. Enter a name such as `Qidi Studio MCP` and a short description.
 4. Under **Connection**, choose **Tunnel**, then select the available tunnel or
    enter its `tunnel_id`.
-5. Create the connection and confirm that 117 tools are discovered.
+5. Create the connection and confirm that 118 tools are discovered.
 6. Start a new conversation and enable **Qidi Studio MCP** from the tools menu.
 
 Example checks:
@@ -83,6 +83,83 @@ at [ChatGPT Plugins](https://chatgpt.com/plugins), select **Refresh**, confirm t
 new tool count, and start a new conversation. This follows the
 [official OpenAI connection workflow](https://developers.openai.com/plugins/deploy/connect-chatgpt).
 
+## Attachment-to-print workflow
+
+Version 1.10.0 supports a guarded conversational workflow from a ChatGPT file
+attachment through physical printing. Attached STL, 3MF, OBJ, AMF, STEP, STP,
+and PLY files can be imported without first copying them to the QIDI Studio
+computer.
+
+The physical filament source must be chosen **before slicing**. The MCP does not
+infer a QIDI Box bay or silently default to the external feeder.
+
+### Filament numbering
+
+- `project_filament_index` is zero-based within the QIDI Studio project.
+- Object and volume `extruder` values are one-based. Project filament index `3`
+  therefore uses extruder `4`.
+- Physical `slot_id` is a zero-based global feeder index. QIDI Box slots are
+  `0` through `15`; the external feeder is slot `16`.
+- With one QIDI Box, its physically labeled bays 1 through 4 correspond to
+  global slot IDs `0` through `3`.
+
+For example, a red spool in the fourth bay of the first QIDI Box is physical
+slot `3`. If its matching project filament is index `3`, the model must use
+extruder `4` and be sliced after that assignment.
+
+### Guarded sequence
+
+1. Attach the model in ChatGPT and call `import_attached_models`, optionally
+   with arrangement enabled.
+2. Call `get_printer_details`, show the available QIDI Box and external sources,
+   and ask the user which physical filament to use.
+3. Assign every printable model part to the matching project filament with
+   `set_object_extruder` or `set_volume_extruder`. These operations invalidate
+   an older slice.
+4. Review settings and slice the active plate.
+5. Call `prepare_print_job` with the matching project and physical source. A
+   QIDI Box example is:
+
+   ```json
+   {
+     "device_id": "printer-device-id",
+     "filament_source": {
+       "project_filament_index": 3,
+       "source": "qidi_box",
+       "slot_id": 3
+     },
+     "bed_leveling": true,
+     "timelapse": false
+   }
+   ```
+
+   For the external feeder, use `"source": "external"`; physical slot `16` is
+   derived automatically.
+6. Review the returned summary and physical checks. Preparation rejects stale
+   or mismatched slices and returns a short-lived, single-use confirmation
+   token. It does not upload or print.
+7. Only after explicit user approval, call `start_print_job` with that token and
+   `confirm: true`.
+8. Poll `get_print_job_status`. The previously loaded toolhead slot may remain
+   `pending_physical_load` during layer-zero heating and QIDI Box exchange.
+   Printing is confirmed only after telemetry reports both the matching job and
+   selected physical slot. Cancellation is recommended if the first print layer
+   begins while the slot still mismatches.
+
+Guarded direct start currently supports exactly one sliced project filament.
+Use QIDI Studio's native Send-to-Printer dialog for multi-filament jobs until a
+complete per-filament physical mapping is available through MCP.
+
+Example conversation requests:
+
+```text
+Import this attached model, arrange it, and report its dimensions and printability. Do not slice or print.
+
+Use red PETG from QIDI Box physical slot 3. Assign the matching project filament, slice, run preflight, and prepare the print. Stop before start_print_job.
+
+Use only the newest prepared token, start with confirmation, and monitor until the selected physical slot and printing are both confirmed.
+```
+
 ## Security and operational boundaries
 
 - The MCP server listens only on `127.0.0.1`; remote access is provided by the
@@ -94,16 +171,20 @@ new tool count, and start a new conversation. This follows the
 - Preview tools are read-only and explicitly report `mutated: false`.
 - Model and settings mutations use QIDI Studio's native data structures and
   undo/reslice paths where applicable.
-- Print start uses a prepared confirmation token plus an explicit confirmation.
-  Cancel and destructive operations also require confirmation where applicable.
+- Print preparation requires an explicit physical filament source and verifies
+  that the valid slice uses its matching project filament. Print start uses a
+  prepared confirmation token plus explicit confirmation, applies QIDI's native
+  Box/external mapping, and verifies the physically loaded slot through printer
+  telemetry. Cancel and destructive operations also require confirmation where
+  applicable.
 - Software checks cannot verify physical conditions such as plate cleanliness,
   correct filament loading, an empty build plate, or safe machine access. The
   operator remains responsible for the printer and surrounding area.
 
 Intentionally unsupported or deferred capabilities include embedded tunnel
-credentials, automatic visual failure detection and cancellation, cloud-only
-print start, and operations that cannot be exposed safely through stable native
-QIDI Studio state.
+credentials, automatic visual failure detection and cancellation, automated
+multi-filament physical-source mapping, cloud-only print start, and operations
+that cannot be exposed safely through stable native QIDI Studio state.
 
 ## Build from source
 

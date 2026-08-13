@@ -2,7 +2,7 @@
 
 ## v1.10.0
 
-- Status: Windows x64 build and live acceptance passed; attachment import, enum serialization, and concurrent-request regression tests completed without HTTP 504. Tool count: 118.
+- Status: Windows x64 build and live end-to-end acceptance passed for attachment import, GUI contention, enum serialization, explicit physical-filament selection, guarded print start, and printer-slot verification. Tool count: 118.
 - Added `import_attached_models` so ChatGPT can pass user-attached STL, 3MF, OBJ, AMF, STEP, STP, or PLY files directly to QIDI Studio using the official `_meta["openai/fileParams"]` contract.
 - Streamed attachments into a randomized per-request directory under the current user's QIDI Studio MCP application-data directory, imported them with QIDI's native model loader, and removed the temporary files after the import attempt.
 - Preserved `import_model` for models that already exist on the QIDI Studio computer.
@@ -15,6 +15,7 @@
 - Made overlapping GUI-backed MCP calls fail fast with retryable `GUI_BUSY` metadata instead of waiting behind the active request until the tunnel returns HTTP 504; a full 23-setting non-mutating preview passed afterward with all four QIDI Box slots and the external filament slot active.
 - Required guarded direct prints to name an explicit QIDI Box slot or external spool, invalidated old slices when object filament assignments change, verified that the valid slice was generated with the matching project filament, locked slot telemetry into the confirmation token, applied QIDI's native `enable_box`/`value_tN` mapping commands before upload, and required matching physical-slot telemetry before reporting acceptance or printing as confirmed. Multi-filament direct starts remain blocked pending complete per-filament mapping support.
 - Treated the previously loaded toolhead slot as pending during printer preparation and QIDI Box filament exchange; physical-source mismatch is now reported only if the first print layer begins without the requested slot, preventing premature cancellation at layer zero.
+- Completed live attachment-to-print acceptance on a Max 4 with the 608-bearing STL: the model was assigned to project filament index 3/extruder 4 before slicing, mapped to red PETG in QIDI Box global slot 3, confirmed by `reported_physical_slot: slot3`, and printed successfully without using external slot 16.
 - Updated MCP `serverInfo.version` and `get_suite_capabilities().suite_version` to `1.10.0`.
 
 ## v1.9.1
