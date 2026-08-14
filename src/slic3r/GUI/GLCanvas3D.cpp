@@ -2491,6 +2491,35 @@ void GLCanvas3D::mark_context_dirty()
     m_dirty_context = true;
 }
 
+bool GLCanvas3D::capture_framebuffer(std::vector<unsigned char>& pixels,
+                                     unsigned int& width, unsigned int& height)
+{
+    pixels.clear();
+    width = 0;
+    height = 0;
+    if (m_canvas == nullptr || m_in_render)
+        return false;
+
+    m_capture_framebuffer_pixels.clear();
+    m_capture_framebuffer_width = 0;
+    m_capture_framebuffer_height = 0;
+    m_capture_framebuffer_succeeded = false;
+    m_capture_framebuffer_requested = true;
+    Slic3r::ScopeGuard capture_guard([this]() {
+        m_capture_framebuffer_requested = false;
+    });
+    (void)capture_guard;
+
+    render();
+    if (!m_capture_framebuffer_succeeded)
+        return false;
+
+    pixels = std::move(m_capture_framebuffer_pixels);
+    width = m_capture_framebuffer_width;
+    height = m_capture_framebuffer_height;
+    return !pixels.empty() && width > 0 && height > 0;
+}
+
 void GLCanvas3D::render(bool only_init)
 {
     if (m_in_render) {
@@ -2511,7 +2540,8 @@ void GLCanvas3D::render(bool only_init)
         return;
 
     // ensures this canvas is current and initialized
-    if (!_is_shown_on_screen() || !_set_current(true) || !wxGetApp().init_opengl())
+    if ((!m_capture_framebuffer_requested && !_is_shown_on_screen()) ||
+        !_set_current(true) || !wxGetApp().init_opengl())
         return;
 
     if (!is_initialized() && !init())
@@ -2831,6 +2861,40 @@ void GLCanvas3D::render(bool only_init)
     wxGetApp().imgui()->render();
     ogl_manager.unbind_vao();
     ogl_manager.clear_dirty();
+
+    if (m_capture_framebuffer_requested) {
+        m_capture_framebuffer_succeeded = false;
+        const Size canvas_size = get_canvas_size();
+        const int canvas_width = canvas_size.get_width();
+        const int canvas_height = canvas_size.get_height();
+        if (canvas_width > 0 && canvas_height > 0) {
+            m_capture_framebuffer_width = static_cast<unsigned int>(canvas_width);
+            m_capture_framebuffer_height = static_cast<unsigned int>(canvas_height);
+            m_capture_framebuffer_pixels.resize(
+                static_cast<std::size_t>(m_capture_framebuffer_width) *
+                m_capture_framebuffer_height * 4);
+
+            GLint previous_pack_alignment = 4;
+            GLint previous_read_buffer = GL_BACK;
+            ::glGetIntegerv(GL_PACK_ALIGNMENT, &previous_pack_alignment);
+            ::glGetIntegerv(GL_READ_BUFFER, &previous_read_buffer);
+            while (::glGetError() != GL_NO_ERROR) {}
+            ::glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            ::glReadBuffer(GL_BACK);
+            ::glReadPixels(0, 0, canvas_width, canvas_height, GL_RGBA,
+                           GL_UNSIGNED_BYTE, m_capture_framebuffer_pixels.data());
+            const GLenum capture_error = ::glGetError();
+            ::glReadBuffer(static_cast<GLenum>(previous_read_buffer));
+            ::glPixelStorei(GL_PACK_ALIGNMENT, previous_pack_alignment);
+
+            m_capture_framebuffer_succeeded = capture_error == GL_NO_ERROR;
+            if (!m_capture_framebuffer_succeeded) {
+                m_capture_framebuffer_pixels.clear();
+                m_capture_framebuffer_width = 0;
+                m_capture_framebuffer_height = 0;
+            }
+        }
+    }
     m_canvas->SwapBuffers();
 
     for (const auto& cb : m_frame_callback_list) {

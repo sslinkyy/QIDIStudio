@@ -2,6 +2,7 @@
 #include "QDSDeviceManager.hpp"
 #include "GUI_App.hpp"
 #include "GUI_ObjectList.hpp"
+#include "GLCanvas3D.hpp"
 #include "MainFrame.hpp"
 #include "Plater.hpp"
 #include "PartPlate.hpp"
@@ -24,6 +25,7 @@
 #include <nlohmann/json.hpp>
 
 #include <wx/bitmap.h>
+#include <wx/glcanvas.h>
 #include <wx/dcmemory.h>
 #include <wx/dcscreen.h>
 #include <wx/dialog.h>
@@ -707,7 +709,9 @@ json attach_mcp_image(json metadata, const std::string& bytes, const std::string
 
     metadata["image"] = {{"mime_type", mime_type}, {"byte_count", bytes.size()}};
     metadata["download"] = {
-        {"url", "http://127.0.0.1:8765/captures/" + token + "/" + filename},
+        {"scheme", "http"},
+        {"origin", "127.0.0.1:8765"},
+        {"path", "/captures/" + token + "/" + filename},
         {"filename", filename},
         {"expires_at_utc", utc_time_string(expires_at)},
         {"local_computer_only", true}
@@ -906,6 +910,17 @@ json capture_studio_screenshot(const json& args)
         frame->Update();
         wxYieldIfNeeded();
 
+        const int captured_tab = frame->m_tabpanel->GetSelection();
+        const std::string captured_view = captured_tab == MainFrame::tp3DEditor ? "prepare" :
+                                          captured_tab == MainFrame::tpPreview ? "preview" : "other";
+#ifdef __WXMSW__
+        GLCanvas3D* canvas_to_capture = nullptr;
+        if (captured_tab == MainFrame::tp3DEditor)
+            canvas_to_capture = require_plater()->get_view3D_canvas3D();
+        else if (captured_tab == MainFrame::tpPreview)
+            canvas_to_capture = require_plater()->get_preview_canvas3D();
+#endif
+
         const wxRect rect = frame->GetScreenRect();
         if (rect.width <= 0 || rect.height <= 0)
             throw std::runtime_error("QIDI Studio main window has no capturable area");
@@ -958,7 +973,100 @@ json capture_studio_screenshot(const json& args)
             throw std::runtime_error("Windows could not render the QIDI Studio window for capture");
         capture_method = captured_offscreen ? "windows_print_window_offscreen"
                                             : "windows_print_window";
+
+        bool gl_canvas_composited = false;
+        int gl_canvas_x = 0;
+        int gl_canvas_y = 0;
+        int gl_canvas_width = 0;
+        int gl_canvas_height = 0;
+        int gl_canvas_dynamic_range = 0;
+        if (canvas_to_capture != nullptr) {
+            std::vector<unsigned char> rgba;
+            unsigned int framebuffer_width = 0;
+            unsigned int framebuffer_height = 0;
+            if (!canvas_to_capture->capture_framebuffer(
+                    rgba, framebuffer_width, framebuffer_height))
+                throw std::runtime_error(
+                    "QIDI Studio could not capture the OpenGL build-plate canvas");
+
+            wxGLCanvas* canvas_window = canvas_to_capture->get_wxglcanvas();
+            const HWND canvas_hwnd = canvas_window != nullptr
+                ? reinterpret_cast<HWND>(canvas_window->GetHandle()) : nullptr;
+            RECT frame_bounds{};
+            RECT canvas_bounds{};
+            if (canvas_hwnd == nullptr ||
+                ::GetWindowRect(hwnd, &frame_bounds) == FALSE ||
+                ::GetWindowRect(canvas_hwnd, &canvas_bounds) == FALSE)
+                throw std::runtime_error(
+                    "QIDI Studio could not locate the OpenGL canvas in the captured window");
+
+            const int native_frame_width = frame_bounds.right - frame_bounds.left;
+            const int native_frame_height = frame_bounds.bottom - frame_bounds.top;
+            if (native_frame_width <= 0 || native_frame_height <= 0)
+                throw std::runtime_error("QIDI Studio returned invalid window geometry");
+            gl_canvas_x = static_cast<int>(
+                static_cast<std::int64_t>(canvas_bounds.left - frame_bounds.left) *
+                image.GetWidth() / native_frame_width);
+            gl_canvas_y = static_cast<int>(
+                static_cast<std::int64_t>(canvas_bounds.top - frame_bounds.top) *
+                image.GetHeight() / native_frame_height);
+            gl_canvas_width = static_cast<int>(
+                static_cast<std::int64_t>(canvas_bounds.right - canvas_bounds.left) *
+                image.GetWidth() / native_frame_width);
+            gl_canvas_height = static_cast<int>(
+                static_cast<std::int64_t>(canvas_bounds.bottom - canvas_bounds.top) *
+                image.GetHeight() / native_frame_height);
+            if (gl_canvas_width <= 0 || gl_canvas_height <= 0 ||
+                framebuffer_width == 0 || framebuffer_height == 0 ||
+                rgba.size() != static_cast<std::size_t>(framebuffer_width) *
+                                   framebuffer_height * 4)
+                throw std::runtime_error("QIDI Studio returned an invalid OpenGL canvas capture");
+
+            unsigned char minimum_canvas_channel = 255;
+            unsigned char maximum_canvas_channel = 0;
+            unsigned char* destination = image.GetData();
+            for (int destination_y = 0; destination_y < gl_canvas_height; ++destination_y) {
+                const int image_y = gl_canvas_y + destination_y;
+                if (image_y < 0 || image_y >= image.GetHeight())
+                    continue;
+                const unsigned int source_y = framebuffer_height - 1 -
+                    static_cast<unsigned int>(
+                        static_cast<std::uint64_t>(destination_y) * framebuffer_height /
+                        static_cast<unsigned int>(gl_canvas_height));
+                for (int destination_x = 0; destination_x < gl_canvas_width; ++destination_x) {
+                    const int image_x = gl_canvas_x + destination_x;
+                    if (image_x < 0 || image_x >= image.GetWidth())
+                        continue;
+                    const unsigned int source_x = static_cast<unsigned int>(
+                        static_cast<std::uint64_t>(destination_x) * framebuffer_width /
+                        static_cast<unsigned int>(gl_canvas_width));
+                    const std::size_t source_offset =
+                        (static_cast<std::size_t>(source_y) * framebuffer_width + source_x) * 4;
+                    const std::size_t destination_offset =
+                        (static_cast<std::size_t>(image_y) * image.GetWidth() + image_x) * 3;
+                    for (int channel = 0; channel < 3; ++channel) {
+                        const unsigned char value = rgba[source_offset + channel];
+                        destination[destination_offset + channel] = value;
+                        minimum_canvas_channel = std::min(minimum_canvas_channel, value);
+                        maximum_canvas_channel = std::max(maximum_canvas_channel, value);
+                    }
+                }
+            }
+            gl_canvas_dynamic_range = static_cast<int>(maximum_canvas_channel) -
+                                      static_cast<int>(minimum_canvas_channel);
+            if (gl_canvas_dynamic_range < 4)
+                throw std::runtime_error(
+                    "QIDI Studio returned a blank OpenGL build-plate canvas");
+            gl_canvas_composited = true;
+            capture_method += "+opengl_back_buffer";
+        }
 #else
+        const bool gl_canvas_composited = false;
+        const int gl_canvas_x = 0;
+        const int gl_canvas_y = 0;
+        const int gl_canvas_width = 0;
+        const int gl_canvas_height = 0;
+        const int gl_canvas_dynamic_range = 0;
         wxBitmap bitmap(rect.width, rect.height, 24);
         if (!bitmap.IsOk())
             throw std::runtime_error("Could not allocate the QIDI Studio screenshot bitmap");
@@ -999,10 +1107,6 @@ json capture_studio_screenshot(const json& args)
             throw std::runtime_error("QIDI Studio screenshot exceeds the 8 MiB MCP image limit");
         std::string bytes(stream.GetSize(), '\0');
         stream.CopyTo(bytes.data(), bytes.size());
-        const int selected_tab = frame->m_tabpanel->GetSelection();
-        const std::string captured_view = selected_tab == MainFrame::tp3DEditor ? "prepare" :
-                                          selected_tab == MainFrame::tpPreview ? "preview" : "other";
-
 #ifdef __WXMSW__
         const bool window_was_visible = restore_guard.was_visible;
         const bool window_was_iconized = restore_guard.was_iconized;
@@ -1037,6 +1141,12 @@ json capture_studio_screenshot(const json& args)
                                  {"window_state_restored", state_restored},
                                  {"selected_tab_restored", selected_tab_restored},
                                  {"sampled_dynamic_range", sampled_dynamic_range},
+                                 {"gl_canvas_composited", gl_canvas_composited},
+                                 {"gl_canvas_x", gl_canvas_x},
+                                 {"gl_canvas_y", gl_canvas_y},
+                                 {"gl_canvas_width", gl_canvas_width},
+                                 {"gl_canvas_height", gl_canvas_height},
+                                 {"gl_canvas_dynamic_range", gl_canvas_dynamic_range},
                                  {"screen_capture", capture_method == "screen_pixels"},
                                  {"capture_method", capture_method},
                                  {"note", capture_method == "screen_pixels"
@@ -6938,7 +7048,7 @@ json tools_list()
     tools.push_back(tool_definition("get_ui_state",
         "Report QIDI Studio's selected view, visible dialogs, modal blocking state, and project-recovery state."));
     tools.push_back(tool_definition("capture_studio_screenshot",
-        "Return a PNG image and a short-lived local download URL for the QIDI Studio window. On Windows, background=true temporarily restores a minimized or hidden window outside the visible desktop without activation, captures it, and restores its prior tab and window state. Present the returned download URL to the user as a clickable link.",
+        "Return a PNG image and short-lived local download coordinates for the QIDI Studio window. On Windows, background=true temporarily restores a minimized or hidden window outside the visible desktop without activation, captures it, composites the OpenGL build-plate canvas, and restores its prior tab and window state. Present a clickable URL constructed as download.scheme + '://' + download.origin + download.path.",
         {{"target", {{"type", "string"}, {"enum", json::array({"current", "prepare", "preview"})},
                      {"default", "current"}}},
          {"background", {{"type", "boolean"}, {"default", true}}}}));
