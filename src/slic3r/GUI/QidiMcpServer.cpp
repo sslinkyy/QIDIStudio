@@ -402,8 +402,17 @@ void write_http_response(tcp::socket& socket, int status, const std::string& bod
              << "Access-Control-Allow-Headers: Content-Type, Accept, MCP-Protocol-Version\r\n"
              << "Connection: close\r\n\r\n"
              << body;
+    const std::string response_bytes = response.str();
     boost::system::error_code ec;
-    boost::asio::write(socket, boost::asio::buffer(response.str()), ec);
+    socket.non_blocking(false, ec);
+    if (ec) {
+        BOOST_LOG_TRIVIAL(warning) << "QIDI MCP could not prepare response socket: "
+                                   << ec.message();
+        return;
+    }
+    boost::asio::write(socket, boost::asio::buffer(response_bytes), ec);
+    if (ec)
+        BOOST_LOG_TRIVIAL(warning) << "QIDI MCP response write failed: " << ec.message();
 }
 
 bool find_capture_download(const std::string& target, DownloadableCapture& capture)
@@ -446,7 +455,15 @@ void write_capture_download(tcp::socket& socket, const DownloadableCapture& capt
     std::array<boost::asio::const_buffer, 2> buffers{
         boost::asio::buffer(header_bytes), boost::asio::buffer(capture.bytes)};
     boost::system::error_code ec;
+    socket.non_blocking(false, ec);
+    if (ec) {
+        BOOST_LOG_TRIVIAL(warning) << "QIDI MCP could not prepare capture socket: "
+                                   << ec.message();
+        return;
+    }
     boost::asio::write(socket, buffers, ec);
+    if (ec)
+        BOOST_LOG_TRIVIAL(warning) << "QIDI MCP capture write failed: " << ec.message();
 }
 
 json rpc_error(const json& id, int code, const std::string& message)

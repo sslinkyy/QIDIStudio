@@ -10,6 +10,7 @@
 - Captured the active Prepare or Preview OpenGL back buffer and composited it into the native-window PNG so the bed, models, toolpaths, and current camera are preserved in background captures.
 - Added canvas-specific geometry and dynamic-range metadata and fail closed when a requested Prepare or Preview canvas is missing or blank.
 - Split the loopback download address into scheme, origin, and path metadata so ChatGPT can construct the clickable local link without rejecting the tool result's private URL.
+- Switched MCP responses and capture downloads back to blocking socket writes after request parsing so large PNG/base64 responses cannot be truncated by would_block.
 - Kept the existing visible-window capture path available with `background: false`.
 - Updated MCP `serverInfo.version` and `get_suite_capabilities().suite_version` to `1.11.0`.
 
