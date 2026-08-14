@@ -80,6 +80,8 @@ constexpr std::size_t MAX_ATTACHED_MODEL_FILES = 8;
 constexpr auto GUI_CALL_TIMEOUT = std::chrono::seconds(30);
 constexpr auto PRINT_TOKEN_DEFAULT_TTL = std::chrono::seconds(600);
 constexpr auto PRINT_TOKEN_MAX_TTL = std::chrono::seconds(1800);
+constexpr auto CAPTURE_DOWNLOAD_TTL = std::chrono::minutes(10);
+constexpr std::size_t MAX_CAPTURE_DOWNLOADS = 8;
 
 struct PreparedPrintJob {
     std::string token;
@@ -121,6 +123,13 @@ struct ActivePrintJob {
     std::chrono::system_clock::time_point updated_at;
 };
 
+struct DownloadableCapture {
+    std::string bytes;
+    std::string mime_type;
+    std::string filename;
+    std::chrono::system_clock::time_point expires_at;
+};
+
 std::mutex& print_job_mutex()
 {
     static std::mutex mutex;
@@ -137,6 +146,18 @@ std::unordered_map<std::string, std::shared_ptr<ActivePrintJob>>& active_print_j
 {
     static std::unordered_map<std::string, std::shared_ptr<ActivePrintJob>> jobs;
     return jobs;
+}
+
+std::mutex& capture_download_mutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::unordered_map<std::string, DownloadableCapture>& capture_downloads()
+{
+    static std::unordered_map<std::string, DownloadableCapture> captures;
+    return captures;
 }
 
 std::string random_hex_id(std::size_t bytes)
@@ -383,6 +404,49 @@ void write_http_response(tcp::socket& socket, int status, const std::string& bod
     boost::asio::write(socket, boost::asio::buffer(response.str()), ec);
 }
 
+bool find_capture_download(const std::string& target, DownloadableCapture& capture)
+{
+    static const std::string prefix = "/captures/";
+    if (target.rfind(prefix, 0) != 0)
+        return false;
+    const std::string remainder = target.substr(prefix.size());
+    const std::size_t separator = remainder.find('/');
+    const std::string token = remainder.substr(0, separator);
+    if (token.size() != 48 ||
+        !std::all_of(token.begin(), token.end(), [](unsigned char value) { return std::isxdigit(value) != 0; }))
+        return false;
+
+    const auto now = std::chrono::system_clock::now();
+    std::lock_guard<std::mutex> lock(capture_download_mutex());
+    auto& captures = capture_downloads();
+    auto found = captures.find(token);
+    if (found == captures.end())
+        return false;
+    if (found->second.expires_at <= now) {
+        captures.erase(found);
+        return false;
+    }
+    capture = found->second;
+    return true;
+}
+
+void write_capture_download(tcp::socket& socket, const DownloadableCapture& capture)
+{
+    std::ostringstream headers;
+    headers << "HTTP/1.1 200 OK\r\n"
+            << "Content-Type: " << capture.mime_type << "\r\n"
+            << "Content-Length: " << capture.bytes.size() << "\r\n"
+            << "Content-Disposition: attachment; filename=\"" << capture.filename << "\"\r\n"
+            << "Cache-Control: private, no-store\r\n"
+            << "X-Content-Type-Options: nosniff\r\n"
+            << "Connection: close\r\n\r\n";
+    const std::string header_bytes = headers.str();
+    std::array<boost::asio::const_buffer, 2> buffers{
+        boost::asio::buffer(header_bytes), boost::asio::buffer(capture.bytes)};
+    boost::system::error_code ec;
+    boost::asio::write(socket, buffers, ec);
+}
+
 json rpc_error(const json& id, int code, const std::string& message)
 {
     return {
@@ -618,9 +682,36 @@ const char* image_mime_type(const std::string& bytes)
     return nullptr;
 }
 
-json attach_mcp_image(json metadata, const std::string& bytes, const std::string& mime_type)
+json attach_mcp_image(json metadata, const std::string& bytes, const std::string& mime_type,
+                      const std::string& filename_stem)
 {
+    const auto now = std::chrono::system_clock::now();
+    const auto expires_at = now + CAPTURE_DOWNLOAD_TTL;
+    const std::string token = random_hex_id(24);
+    const std::string extension = mime_type == "image/jpeg" ? ".jpg" :
+                                  mime_type == "image/webp" ? ".webp" : ".png";
+    const std::string filename = filename_stem + "-" + token.substr(0, 12) + extension;
+    {
+        std::lock_guard<std::mutex> lock(capture_download_mutex());
+        auto& captures = capture_downloads();
+        for (auto iterator = captures.begin(); iterator != captures.end();) {
+            if (iterator->second.expires_at <= now)
+                iterator = captures.erase(iterator);
+            else
+                ++iterator;
+        }
+        while (captures.size() >= MAX_CAPTURE_DOWNLOADS)
+            captures.erase(captures.begin());
+        captures.emplace(token, DownloadableCapture{bytes, mime_type, filename, expires_at});
+    }
+
     metadata["image"] = {{"mime_type", mime_type}, {"byte_count", bytes.size()}};
+    metadata["download"] = {
+        {"url", "http://127.0.0.1:8765/captures/" + token + "/" + filename},
+        {"filename", filename},
+        {"expires_at_utc", utc_time_string(expires_at)},
+        {"local_computer_only", true}
+    };
     metadata["_mcp_image"] = {{"mimeType", mime_type}, {"data", base64_encode(bytes)}};
     return metadata;
 }
@@ -953,7 +1044,7 @@ json capture_studio_screenshot(const json& args)
                                      : captured_offscreen
                                          ? "QIDI Studio was rendered outside the visible desktop without activation and its prior window state was restored."
                                          : "Captured directly from the QIDI Studio window; overlapping windows are excluded."}},
-                                bytes, "image/png");
+                                bytes, "image/png", "qidi-studio-" + captured_view);
     });
 }
 
@@ -1049,7 +1140,7 @@ json capture_printer_camera(QDSDeviceManager* manager, const json& args)
                              {"device_id", device_id}, {"printer_name", device->m_name},
                              {"light_was_on", light_was_on}, {"light_command_sent", true},
                              {"light_left_on", true}, {"light_warmup_ms", warmup_ms}},
-                            body, mime_type);
+                            body, mime_type, "qidi-printer-camera");
 }
 
 json set_printer_case_light(QDSDeviceManager* manager, const json& args)
@@ -6847,7 +6938,7 @@ json tools_list()
     tools.push_back(tool_definition("get_ui_state",
         "Report QIDI Studio's selected view, visible dialogs, modal blocking state, and project-recovery state."));
     tools.push_back(tool_definition("capture_studio_screenshot",
-        "Return a PNG image of the QIDI Studio window. On Windows, background=true temporarily restores a minimized or hidden window outside the visible desktop without activation, captures it, and restores its prior tab and window state.",
+        "Return a PNG image and a short-lived local download URL for the QIDI Studio window. On Windows, background=true temporarily restores a minimized or hidden window outside the visible desktop without activation, captures it, and restores its prior tab and window state. Present the returned download URL to the user as a clickable link.",
         {{"target", {{"type", "string"}, {"enum", json::array({"current", "prepare", "preview"})},
                      {"default", "current"}}},
          {"background", {{"type", "boolean"}, {"default", true}}}}));
@@ -7261,7 +7352,7 @@ json tools_list()
         "Return detailed physical-printer status including nozzle report, temperatures, fans, explicitly labeled QIDI Box slots 0-15 and external slot 16, the currently loaded physical slot, and camera metadata.",
         {{"device_id", {{"type", "string"}, {"minLength", 1}}}}, {"device_id"}));
     tools.push_back(tool_definition("capture_printer_camera",
-        "Turn on the printer case light when needed, wait for exposure, and return the current camera image as MCP image content. The light is left on.",
+        "Turn on the printer case light when needed, wait for exposure, and return the current camera image as MCP image content with a short-lived local download URL. Present the returned download URL to the user as a clickable link. The light is left on.",
         {{"device_id", {{"type", "string"}, {"minLength", 1}}},
          {"light_warmup_ms", {{"type", "integer"}, {"minimum", 0}, {"maximum", 5000}, {"default", 1200}}}},
         {"device_id"}));
@@ -7644,6 +7735,14 @@ struct QidiMcpServer::Impl
         }
         if (request.method == "OPTIONS") {
             write_http_response(socket, 204, "");
+            return;
+        }
+        if (request.method == "GET" && request.target.rfind("/captures/", 0) == 0) {
+            DownloadableCapture capture;
+            if (!find_capture_download(request.target, capture))
+                write_http_response(socket, 404, "{\"error\":\"capture not found or expired\"}");
+            else
+                write_capture_download(socket, capture);
             return;
         }
         if (request.target != "/mcp") {
