@@ -2,7 +2,8 @@
 
 ## v1.11.0
 
-- Status: background/offscreen capture, OpenGL canvas composition, local download, and large-response transport acceptance passed; MCP App inline-viewer rebuild and live ChatGPT acceptance pending. Tool count: 118.
+- Status: Windows x64 build, packaged launch, background/offscreen capture, OpenGL canvas composition, local download, large-response transport, MCP App inline viewer, viewer security metadata, and live ChatGPT acceptance passed. Tool count: 118.
+- Added **MCP Edition** branding to the QIDI Studio startup splash while preserving the upstream artwork.
 - Added an MCP Apps capture viewer resource and linked all three image-producing tools to it so compatible ChatGPT clients can display Studio screenshots and printer-camera frames directly in the conversation, including a responsive image view and download control.
 - Kept image bytes inside the authenticated MCP tool result and retained loopback download URLs only as a local fallback; no capture endpoint is exposed through the external tunnel.
 - Hydrated the viewer from ChatGPT's full tool-response metadata when the initial result notification arrives before component subscription, versioned the resource URI to invalidate cached viewer HTML, and directed non-MCP-Apps clients to materialize the returned image content as an inline temporary attachment instead of merely reporting capture success.
@@ -12,7 +13,7 @@
 - Added sampled dynamic-range validation so an entirely blank background render fails explicitly instead of being returned as a successful image.
 - Added short-lived loopback download URLs for Studio screenshots and printer-camera images so the assistant can provide a normal clickable file link without publishing captures through the external tunnel.
 - Captured the active Prepare or Preview OpenGL back buffer and composited it into the native-window PNG so the bed, models, toolpaths, and current camera are preserved in background captures.
-- Added canvas-specific geometry and dynamic-range metadata and fail closed when a requested Prepare or Preview canvas is missing or blank.
+- Added canvas-specific geometry and dynamic-range metadata; blank captured canvases fail explicitly, and callers can use `gl_canvas_composited` to detect and retry an early-startup capture before the Prepare or Preview canvas is ready.
 - Split the loopback download address into scheme, origin, and path metadata so ChatGPT can construct the clickable local link without rejecting the tool result's private URL.
 - Switched MCP responses and capture downloads back to blocking socket writes after request parsing so large PNG/base64 responses cannot be truncated by would_block.
 - Kept the existing visible-window capture path available with `background: false`.
