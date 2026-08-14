@@ -2,6 +2,7 @@
 #include "QDSDeviceManager.hpp"
 #include "GUI_App.hpp"
 #include "GUI_ObjectList.hpp"
+#include "GLCanvas3D.hpp"
 #include "MainFrame.hpp"
 #include "Plater.hpp"
 #include "PartPlate.hpp"
@@ -24,6 +25,7 @@
 #include <nlohmann/json.hpp>
 
 #include <wx/bitmap.h>
+#include <wx/glcanvas.h>
 #include <wx/dcmemory.h>
 #include <wx/dcscreen.h>
 #include <wx/dialog.h>
@@ -80,6 +82,113 @@ constexpr std::size_t MAX_ATTACHED_MODEL_FILES = 8;
 constexpr auto GUI_CALL_TIMEOUT = std::chrono::seconds(30);
 constexpr auto PRINT_TOKEN_DEFAULT_TTL = std::chrono::seconds(600);
 constexpr auto PRINT_TOKEN_MAX_TTL = std::chrono::seconds(1800);
+constexpr auto CAPTURE_DOWNLOAD_TTL = std::chrono::minutes(10);
+constexpr std::size_t MAX_CAPTURE_DOWNLOADS = 8;
+constexpr const char* CAPTURE_VIEWER_URI = "ui://qidi-studio/capture-viewer-v3.html";
+
+const char* capture_viewer_html()
+{
+    return R"QIDI_UI(<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>QIDI Studio Capture</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: transparent; color: CanvasText; }
+  main { overflow: hidden; border: 1px solid color-mix(in srgb, CanvasText 18%, transparent); border-radius: 12px; background: Canvas; }
+  .frame { display: grid; min-height: 180px; place-items: center; background: #111; }
+  img { display: block; width: 100%; height: auto; max-height: 72vh; object-fit: contain; }
+  .loading { padding: 48px 20px; color: #ddd; text-align: center; }
+  footer { display: flex; align-items: center; gap: 8px; padding: 10px 12px; }
+  .details { min-width: 0; flex: 1; }
+  .title { overflow: hidden; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+  .meta { margin-top: 2px; color: color-mix(in srgb, CanvasText 62%, transparent); font-size: 12px; }
+  a { border: 1px solid color-mix(in srgb, CanvasText 24%, transparent); border-radius: 8px; padding: 7px 10px; color: inherit; text-decoration: none; white-space: nowrap; }
+  a[hidden] { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <div class="frame">
+    <div id="loading" class="loading">Waiting for the QIDI capture...</div>
+    <img id="capture" hidden alt="QIDI capture">
+  </div>
+  <footer>
+    <div class="details">
+      <div id="title" class="title">QIDI Studio capture</div>
+      <div id="meta" class="meta">The image will appear when capture completes.</div>
+    </div>
+    <a id="download" hidden download>Download PNG</a>
+  </footer>
+</main>
+<script>
+(() => {
+  const capture = document.getElementById("capture");
+  const loading = document.getElementById("loading");
+  const title = document.getElementById("title");
+  const meta = document.getElementById("meta");
+  const download = document.getElementById("download");
+
+  function normalizeToolResult(value) {
+    if (!value || typeof value !== "object") return null;
+    if (Array.isArray(value.content) || value.structuredContent) return value;
+    for (const key of ["mcp_tool_result", "call_tool_result", "result"]) {
+      const nested = normalizeToolResult(value[key]);
+      if (nested) return nested;
+    }
+    return null;
+  }
+
+  function render(result) {
+    const blocks = Array.isArray(result && result.content) ? result.content : [];
+    const image = blocks.find(block => block && block.type === "image" && typeof block.data === "string");
+    const details = result && result.structuredContent && typeof result.structuredContent === "object"
+      ? result.structuredContent : {};
+
+    if (!image) {
+      loading.textContent = details.error || "Capture completed without an image that this host can display.";
+      return;
+    }
+
+    const mimeType = image.mimeType || "image/png";
+    const dataUrl = `data:${mimeType};base64,${image.data}`;
+    const filename = details.download && details.download.filename
+      ? details.download.filename : "qidi-capture.png";
+    const view = details.view || details.source || "QIDI";
+    const dimensions = details.width && details.height ? `${details.width} x ${details.height}` : "";
+
+    capture.src = dataUrl;
+    capture.alt = `${view} capture`;
+    capture.hidden = false;
+    loading.hidden = true;
+    title.textContent = filename;
+    meta.textContent = [view, dimensions].filter(Boolean).join(" | ");
+    download.href = dataUrl;
+    download.download = filename;
+    download.hidden = false;
+  }
+
+  window.addEventListener("message", event => {
+    if (event.source !== window.parent) return;
+    const message = event.data;
+    if (message && message.jsonrpc === "2.0" && message.method === "ui/notifications/tool-result") {
+      const result = normalizeToolResult(message.params);
+      if (result) render(result);
+    }
+  });
+
+  const openai = typeof window !== "undefined" ? window.openai : undefined;
+  const initialResult = normalizeToolResult(openai && openai.toolResponseMetadata)
+    || (openai && openai.toolOutput ? { structuredContent: openai.toolOutput } : null);
+  if (initialResult) render(initialResult);
+})();
+</script>
+</body>
+</html>)QIDI_UI";
+}
 
 struct PreparedPrintJob {
     std::string token;
@@ -121,6 +230,13 @@ struct ActivePrintJob {
     std::chrono::system_clock::time_point updated_at;
 };
 
+struct DownloadableCapture {
+    std::string bytes;
+    std::string mime_type;
+    std::string filename;
+    std::chrono::system_clock::time_point expires_at;
+};
+
 std::mutex& print_job_mutex()
 {
     static std::mutex mutex;
@@ -137,6 +253,18 @@ std::unordered_map<std::string, std::shared_ptr<ActivePrintJob>>& active_print_j
 {
     static std::unordered_map<std::string, std::shared_ptr<ActivePrintJob>> jobs;
     return jobs;
+}
+
+std::mutex& capture_download_mutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::unordered_map<std::string, DownloadableCapture>& capture_downloads()
+{
+    static std::unordered_map<std::string, DownloadableCapture> captures;
+    return captures;
 }
 
 std::string random_hex_id(std::size_t bytes)
@@ -379,8 +507,68 @@ void write_http_response(tcp::socket& socket, int status, const std::string& bod
              << "Access-Control-Allow-Headers: Content-Type, Accept, MCP-Protocol-Version\r\n"
              << "Connection: close\r\n\r\n"
              << body;
+    const std::string response_bytes = response.str();
     boost::system::error_code ec;
-    boost::asio::write(socket, boost::asio::buffer(response.str()), ec);
+    socket.non_blocking(false, ec);
+    if (ec) {
+        BOOST_LOG_TRIVIAL(warning) << "QIDI MCP could not prepare response socket: "
+                                   << ec.message();
+        return;
+    }
+    boost::asio::write(socket, boost::asio::buffer(response_bytes), ec);
+    if (ec)
+        BOOST_LOG_TRIVIAL(warning) << "QIDI MCP response write failed: " << ec.message();
+}
+
+bool find_capture_download(const std::string& target, DownloadableCapture& capture)
+{
+    static const std::string prefix = "/captures/";
+    if (target.rfind(prefix, 0) != 0)
+        return false;
+    const std::string remainder = target.substr(prefix.size());
+    const std::size_t separator = remainder.find('/');
+    const std::string token = remainder.substr(0, separator);
+    if (token.size() != 48 ||
+        !std::all_of(token.begin(), token.end(), [](unsigned char value) { return std::isxdigit(value) != 0; }))
+        return false;
+
+    const auto now = std::chrono::system_clock::now();
+    std::lock_guard<std::mutex> lock(capture_download_mutex());
+    auto& captures = capture_downloads();
+    auto found = captures.find(token);
+    if (found == captures.end())
+        return false;
+    if (found->second.expires_at <= now) {
+        captures.erase(found);
+        return false;
+    }
+    capture = found->second;
+    return true;
+}
+
+void write_capture_download(tcp::socket& socket, const DownloadableCapture& capture)
+{
+    std::ostringstream headers;
+    headers << "HTTP/1.1 200 OK\r\n"
+            << "Content-Type: " << capture.mime_type << "\r\n"
+            << "Content-Length: " << capture.bytes.size() << "\r\n"
+            << "Content-Disposition: attachment; filename=\"" << capture.filename << "\"\r\n"
+            << "Cache-Control: private, no-store\r\n"
+            << "X-Content-Type-Options: nosniff\r\n"
+            << "Connection: close\r\n\r\n";
+    const std::string header_bytes = headers.str();
+    std::array<boost::asio::const_buffer, 2> buffers{
+        boost::asio::buffer(header_bytes), boost::asio::buffer(capture.bytes)};
+    boost::system::error_code ec;
+    socket.non_blocking(false, ec);
+    if (ec) {
+        BOOST_LOG_TRIVIAL(warning) << "QIDI MCP could not prepare capture socket: "
+                                   << ec.message();
+        return;
+    }
+    boost::asio::write(socket, buffers, ec);
+    if (ec)
+        BOOST_LOG_TRIVIAL(warning) << "QIDI MCP capture write failed: " << ec.message();
 }
 
 json rpc_error(const json& id, int code, const std::string& message)
@@ -618,9 +806,38 @@ const char* image_mime_type(const std::string& bytes)
     return nullptr;
 }
 
-json attach_mcp_image(json metadata, const std::string& bytes, const std::string& mime_type)
+json attach_mcp_image(json metadata, const std::string& bytes, const std::string& mime_type,
+                      const std::string& filename_stem)
 {
+    const auto now = std::chrono::system_clock::now();
+    const auto expires_at = now + CAPTURE_DOWNLOAD_TTL;
+    const std::string token = random_hex_id(24);
+    const std::string extension = mime_type == "image/jpeg" ? ".jpg" :
+                                  mime_type == "image/webp" ? ".webp" : ".png";
+    const std::string filename = filename_stem + "-" + token.substr(0, 12) + extension;
+    {
+        std::lock_guard<std::mutex> lock(capture_download_mutex());
+        auto& captures = capture_downloads();
+        for (auto iterator = captures.begin(); iterator != captures.end();) {
+            if (iterator->second.expires_at <= now)
+                iterator = captures.erase(iterator);
+            else
+                ++iterator;
+        }
+        while (captures.size() >= MAX_CAPTURE_DOWNLOADS)
+            captures.erase(captures.begin());
+        captures.emplace(token, DownloadableCapture{bytes, mime_type, filename, expires_at});
+    }
+
     metadata["image"] = {{"mime_type", mime_type}, {"byte_count", bytes.size()}};
+    metadata["download"] = {
+        {"scheme", "http"},
+        {"origin", "127.0.0.1:8765"},
+        {"path", "/captures/" + token + "/" + filename},
+        {"filename", filename},
+        {"expires_at_utc", utc_time_string(expires_at)},
+        {"local_computer_only", true}
+    };
     metadata["_mcp_image"] = {{"mimeType", mime_type}, {"data", base64_encode(bytes)}};
     return metadata;
 }
@@ -670,22 +887,161 @@ json capture_studio_screenshot(const json& args)
     if (target != "current" && target != "prepare" && target != "preview")
         return {{"error", "target must be current, prepare, or preview"}};
 
-    return on_gui_thread([target]() {
+    bool background = true;
+    if (args.contains("background")) {
+        if (!args["background"].is_boolean())
+            return {{"error", "background must be a boolean"}};
+        background = args["background"].get<bool>();
+    }
+
+    return on_gui_thread([target, background]() {
         MainFrame* frame = wxGetApp().mainframe;
         if (frame == nullptr || frame->m_tabpanel == nullptr)
             throw std::runtime_error("QIDI Studio main window is not available");
+
+        const int original_tab = frame->m_tabpanel->GetSelection();
+#ifdef __WXMSW__
+        const HWND hwnd = reinterpret_cast<HWND>(frame->GetHandle());
+        if (hwnd == nullptr)
+            throw std::runtime_error("Could not access the QIDI Studio window");
+
+        struct CaptureRestoreGuard
+        {
+            MainFrame* frame{nullptr};
+            HWND hwnd{nullptr};
+            int selected_tab{-1};
+            WINDOWPLACEMENT placement{};
+            bool placement_valid{false};
+            bool was_visible{false};
+            bool was_iconized{false};
+            bool relocated{false};
+            bool restored{false};
+            bool tab_restore_succeeded{true};
+            bool placement_restore_succeeded{true};
+
+            CaptureRestoreGuard(MainFrame* value, HWND handle, int tab)
+                : frame(value), hwnd(handle), selected_tab(tab)
+            {
+                placement.length = sizeof(placement);
+                placement_valid = ::GetWindowPlacement(hwnd, &placement) != FALSE;
+                was_visible = ::IsWindowVisible(hwnd) != FALSE;
+                was_iconized = ::IsIconic(hwnd) != FALSE;
+            }
+
+            bool show_offscreen()
+            {
+                if (!placement_valid)
+                    throw std::runtime_error("Could not save the QIDI Studio window placement");
+
+                RECT normal = placement.rcNormalPosition;
+                int width = normal.right - normal.left;
+                int height = normal.bottom - normal.top;
+                if (width <= 0 || height <= 0) {
+                    RECT current{};
+                    if (::GetWindowRect(hwnd, &current) == FALSE)
+                        throw std::runtime_error("Could not determine the QIDI Studio window size");
+                    width = current.right - current.left;
+                    height = current.bottom - current.top;
+                }
+                if (width <= 0 || height <= 0)
+                    throw std::runtime_error("QIDI Studio main window has no capturable area");
+
+                const int offscreen_x = ::GetSystemMetrics(SM_XVIRTUALSCREEN) +
+                                        ::GetSystemMetrics(SM_CXVIRTUALSCREEN) + 64;
+                const int offscreen_y = ::GetSystemMetrics(SM_YVIRTUALSCREEN) + 64;
+
+                WINDOWPLACEMENT capture = placement;
+                capture.flags = 0;
+                capture.showCmd = SW_SHOWNOACTIVATE;
+                capture.rcNormalPosition.left = offscreen_x;
+                capture.rcNormalPosition.top = offscreen_y;
+                capture.rcNormalPosition.right = offscreen_x + width;
+                capture.rcNormalPosition.bottom = offscreen_y + height;
+
+                relocated = true;
+                if (::SetWindowPlacement(hwnd, &capture) == FALSE)
+                    throw std::runtime_error("Could not prepare the QIDI Studio window for background capture");
+                if (::SetWindowPos(hwnd, HWND_BOTTOM, offscreen_x, offscreen_y, width, height,
+                                   SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW) == FALSE)
+                    throw std::runtime_error("Could not show the QIDI Studio window off-screen");
+                return true;
+            }
+
+            void restore() noexcept
+            {
+                if (restored)
+                    return;
+                restored = true;
+
+                try {
+                    if (frame != nullptr && frame->m_tabpanel != nullptr &&
+                        selected_tab >= 0 && frame->m_tabpanel->GetSelection() != selected_tab) {
+                        frame->select_tab(static_cast<size_t>(selected_tab));
+                        frame->Layout();
+                        frame->Update();
+                        wxYieldIfNeeded();
+                    }
+                } catch (...) {
+                    tab_restore_succeeded = false;
+                }
+                if (frame != nullptr && frame->m_tabpanel != nullptr && selected_tab >= 0)
+                    tab_restore_succeeded = tab_restore_succeeded &&
+                        frame->m_tabpanel->GetSelection() == selected_tab;
+
+                if (relocated && placement_valid && hwnd != nullptr) {
+                    placement_restore_succeeded =
+                        ::SetWindowPlacement(hwnd, &placement) != FALSE;
+                    if (!was_visible)
+                        ::ShowWindow(hwnd, SW_HIDE);
+                    placement_restore_succeeded = placement_restore_succeeded &&
+                        ((::IsWindowVisible(hwnd) != FALSE) == was_visible) &&
+                        (!was_iconized || ::IsIconic(hwnd) != FALSE);
+                }
+            }
+
+            ~CaptureRestoreGuard()
+            {
+                restore();
+            }
+        };
+
+        CaptureRestoreGuard restore_guard(frame, hwnd, original_tab);
+        if (!background && restore_guard.was_iconized)
+            throw std::runtime_error("Restore the QIDI Studio window before taking a screenshot");
+        const bool captured_offscreen = background &&
+            (restore_guard.was_iconized || !restore_guard.was_visible) &&
+            restore_guard.show_offscreen();
+#else
         if (frame->IsIconized())
             throw std::runtime_error("Restore the QIDI Studio window before taking a screenshot");
+        const bool captured_offscreen = false;
+#endif
 
         if (target != "current") {
             require_plater();
             frame->select_tab(static_cast<size_t>(target == "prepare" ? MainFrame::tp3DEditor
                                                                        : MainFrame::tpPreview));
         }
+#ifdef __WXMSW__
+        if (!background)
+            frame->Show(true);
+#else
         frame->Show(true);
+#endif
         frame->Layout();
         frame->Update();
         wxYieldIfNeeded();
+
+        const int captured_tab = frame->m_tabpanel->GetSelection();
+        const std::string captured_view = captured_tab == MainFrame::tp3DEditor ? "prepare" :
+                                          captured_tab == MainFrame::tpPreview ? "preview" : "other";
+#ifdef __WXMSW__
+        GLCanvas3D* canvas_to_capture = nullptr;
+        if (captured_tab == MainFrame::tp3DEditor)
+            canvas_to_capture = require_plater()->get_view3D_canvas3D();
+        else if (captured_tab == MainFrame::tpPreview)
+            canvas_to_capture = require_plater()->get_preview_canvas3D();
+#endif
 
         const wxRect rect = frame->GetScreenRect();
         if (rect.width <= 0 || rect.height <= 0)
@@ -693,9 +1049,6 @@ json capture_studio_screenshot(const json& args)
         wxImage image;
         std::string capture_method;
 #ifdef __WXMSW__
-        const HWND hwnd = reinterpret_cast<HWND>(frame->GetHandle());
-        if (hwnd == nullptr)
-            throw std::runtime_error("Could not access the QIDI Studio window");
         HDC reference_dc = ::GetDC(hwnd);
         if (reference_dc == nullptr)
             throw std::runtime_error("Could not access the QIDI Studio window");
@@ -740,8 +1093,102 @@ json capture_studio_screenshot(const json& args)
 
         if (!captured || !image.IsOk())
             throw std::runtime_error("Windows could not render the QIDI Studio window for capture");
-        capture_method = "windows_print_window";
+        capture_method = captured_offscreen ? "windows_print_window_offscreen"
+                                            : "windows_print_window";
+
+        bool gl_canvas_composited = false;
+        int gl_canvas_x = 0;
+        int gl_canvas_y = 0;
+        int gl_canvas_width = 0;
+        int gl_canvas_height = 0;
+        int gl_canvas_dynamic_range = 0;
+        if (canvas_to_capture != nullptr) {
+            std::vector<unsigned char> rgba;
+            unsigned int framebuffer_width = 0;
+            unsigned int framebuffer_height = 0;
+            if (!canvas_to_capture->capture_framebuffer(
+                    rgba, framebuffer_width, framebuffer_height))
+                throw std::runtime_error(
+                    "QIDI Studio could not capture the OpenGL build-plate canvas");
+
+            wxGLCanvas* canvas_window = canvas_to_capture->get_wxglcanvas();
+            const HWND canvas_hwnd = canvas_window != nullptr
+                ? reinterpret_cast<HWND>(canvas_window->GetHandle()) : nullptr;
+            RECT frame_bounds{};
+            RECT canvas_bounds{};
+            if (canvas_hwnd == nullptr ||
+                ::GetWindowRect(hwnd, &frame_bounds) == FALSE ||
+                ::GetWindowRect(canvas_hwnd, &canvas_bounds) == FALSE)
+                throw std::runtime_error(
+                    "QIDI Studio could not locate the OpenGL canvas in the captured window");
+
+            const int native_frame_width = frame_bounds.right - frame_bounds.left;
+            const int native_frame_height = frame_bounds.bottom - frame_bounds.top;
+            if (native_frame_width <= 0 || native_frame_height <= 0)
+                throw std::runtime_error("QIDI Studio returned invalid window geometry");
+            gl_canvas_x = static_cast<int>(
+                static_cast<std::int64_t>(canvas_bounds.left - frame_bounds.left) *
+                image.GetWidth() / native_frame_width);
+            gl_canvas_y = static_cast<int>(
+                static_cast<std::int64_t>(canvas_bounds.top - frame_bounds.top) *
+                image.GetHeight() / native_frame_height);
+            gl_canvas_width = static_cast<int>(
+                static_cast<std::int64_t>(canvas_bounds.right - canvas_bounds.left) *
+                image.GetWidth() / native_frame_width);
+            gl_canvas_height = static_cast<int>(
+                static_cast<std::int64_t>(canvas_bounds.bottom - canvas_bounds.top) *
+                image.GetHeight() / native_frame_height);
+            if (gl_canvas_width <= 0 || gl_canvas_height <= 0 ||
+                framebuffer_width == 0 || framebuffer_height == 0 ||
+                rgba.size() != static_cast<std::size_t>(framebuffer_width) *
+                                   framebuffer_height * 4)
+                throw std::runtime_error("QIDI Studio returned an invalid OpenGL canvas capture");
+
+            unsigned char minimum_canvas_channel = 255;
+            unsigned char maximum_canvas_channel = 0;
+            unsigned char* destination = image.GetData();
+            for (int destination_y = 0; destination_y < gl_canvas_height; ++destination_y) {
+                const int image_y = gl_canvas_y + destination_y;
+                if (image_y < 0 || image_y >= image.GetHeight())
+                    continue;
+                const unsigned int source_y = framebuffer_height - 1 -
+                    static_cast<unsigned int>(
+                        static_cast<std::uint64_t>(destination_y) * framebuffer_height /
+                        static_cast<unsigned int>(gl_canvas_height));
+                for (int destination_x = 0; destination_x < gl_canvas_width; ++destination_x) {
+                    const int image_x = gl_canvas_x + destination_x;
+                    if (image_x < 0 || image_x >= image.GetWidth())
+                        continue;
+                    const unsigned int source_x = static_cast<unsigned int>(
+                        static_cast<std::uint64_t>(destination_x) * framebuffer_width /
+                        static_cast<unsigned int>(gl_canvas_width));
+                    const std::size_t source_offset =
+                        (static_cast<std::size_t>(source_y) * framebuffer_width + source_x) * 4;
+                    const std::size_t destination_offset =
+                        (static_cast<std::size_t>(image_y) * image.GetWidth() + image_x) * 3;
+                    for (int channel = 0; channel < 3; ++channel) {
+                        const unsigned char value = rgba[source_offset + channel];
+                        destination[destination_offset + channel] = value;
+                        minimum_canvas_channel = std::min(minimum_canvas_channel, value);
+                        maximum_canvas_channel = std::max(maximum_canvas_channel, value);
+                    }
+                }
+            }
+            gl_canvas_dynamic_range = static_cast<int>(maximum_canvas_channel) -
+                                      static_cast<int>(minimum_canvas_channel);
+            if (gl_canvas_dynamic_range < 4)
+                throw std::runtime_error(
+                    "QIDI Studio returned a blank OpenGL build-plate canvas");
+            gl_canvas_composited = true;
+            capture_method += "+opengl_back_buffer";
+        }
 #else
+        const bool gl_canvas_composited = false;
+        const int gl_canvas_x = 0;
+        const int gl_canvas_y = 0;
+        const int gl_canvas_width = 0;
+        const int gl_canvas_height = 0;
+        const int gl_canvas_dynamic_range = 0;
         wxBitmap bitmap(rect.width, rect.height, 24);
         if (!bitmap.IsOk())
             throw std::runtime_error("Could not allocate the QIDI Studio screenshot bitmap");
@@ -757,24 +1204,79 @@ json capture_studio_screenshot(const json& args)
         capture_method = "screen_pixels";
 #endif
 
+        if (!image.IsOk() || image.GetData() == nullptr)
+            throw std::runtime_error("QIDI Studio returned an invalid screenshot");
+        unsigned char minimum_channel = 255;
+        unsigned char maximum_channel = 0;
+        const unsigned char* image_data = image.GetData();
+        const std::size_t channel_count =
+            static_cast<std::size_t>(image.GetWidth()) * image.GetHeight() * 3;
+        const std::size_t sample_stride = std::max<std::size_t>(3, channel_count / 12000);
+        for (std::size_t offset = 0; offset < channel_count; offset += sample_stride) {
+            minimum_channel = std::min(minimum_channel, image_data[offset]);
+            maximum_channel = std::max(maximum_channel, image_data[offset]);
+        }
+        const int sampled_dynamic_range =
+            static_cast<int>(maximum_channel) - static_cast<int>(minimum_channel);
+        if (sampled_dynamic_range < 4)
+            throw std::runtime_error(
+                "QIDI Studio returned a blank background capture; off-screen OpenGL rendering is required");
+
         wxMemoryOutputStream stream;
-        if (!image.IsOk() || !image.SaveFile(stream, wxBITMAP_TYPE_PNG))
+        if (!image.SaveFile(stream, wxBITMAP_TYPE_PNG))
             throw std::runtime_error("Could not encode the QIDI Studio screenshot");
         if (stream.GetSize() == 0 || stream.GetSize() > MAX_IMAGE_BYTES)
             throw std::runtime_error("QIDI Studio screenshot exceeds the 8 MiB MCP image limit");
         std::string bytes(stream.GetSize(), '\0');
         stream.CopyTo(bytes.data(), bytes.size());
-        const int selected_tab = frame->m_tabpanel->GetSelection();
-        const std::string captured_view = selected_tab == MainFrame::tp3DEditor ? "prepare" :
-                                          selected_tab == MainFrame::tpPreview ? "preview" : "other";
+#ifdef __WXMSW__
+        const bool window_was_visible = restore_guard.was_visible;
+        const bool window_was_iconized = restore_guard.was_iconized;
+        restore_guard.restore();
+        const bool state_restored = restore_guard.placement_restore_succeeded;
+        const bool selected_tab_restored = restore_guard.tab_restore_succeeded;
+#else
+        bool selected_tab_restored = true;
+        if (original_tab >= 0 && frame->m_tabpanel->GetSelection() != original_tab) {
+            try {
+                frame->select_tab(static_cast<size_t>(original_tab));
+                frame->Layout();
+                frame->Update();
+                wxYieldIfNeeded();
+            } catch (...) {
+                selected_tab_restored = false;
+            }
+        }
+        selected_tab_restored = selected_tab_restored &&
+            (original_tab < 0 || frame->m_tabpanel->GetSelection() == original_tab);
+        const bool state_restored = true;
+        const bool window_was_visible = frame->IsShown();
+        const bool window_was_iconized = false;
+#endif
+
         return attach_mcp_image({{"captured", true}, {"source", "qidi_studio_window"},
                                  {"view", captured_view}, {"width", rect.width}, {"height", rect.height},
+                                 {"background_requested", background},
+                                 {"captured_offscreen", captured_offscreen},
+                                 {"window_was_visible", window_was_visible},
+                                 {"window_was_iconized", window_was_iconized},
+                                 {"window_state_restored", state_restored},
+                                 {"selected_tab_restored", selected_tab_restored},
+                                 {"sampled_dynamic_range", sampled_dynamic_range},
+                                 {"gl_canvas_composited", gl_canvas_composited},
+                                 {"gl_canvas_x", gl_canvas_x},
+                                 {"gl_canvas_y", gl_canvas_y},
+                                 {"gl_canvas_width", gl_canvas_width},
+                                 {"gl_canvas_height", gl_canvas_height},
+                                 {"gl_canvas_dynamic_range", gl_canvas_dynamic_range},
                                  {"screen_capture", capture_method == "screen_pixels"},
                                  {"capture_method", capture_method},
-                                 {"note", capture_method == "windows_print_window"
-                                     ? "Captured directly from the QIDI Studio window; overlapping windows are excluded."
-                                     : "The capture contains visible screen pixels; overlapping windows may appear."}},
-                                bytes, "image/png");
+                                 {"note", capture_method == "screen_pixels"
+                                     ? "The capture contains visible screen pixels; overlapping windows may appear."
+                                     : captured_offscreen
+                                         ? "QIDI Studio was rendered outside the visible desktop without activation and its prior window state was restored."
+                                         : "Captured directly from the QIDI Studio window; overlapping windows are excluded."}},
+                                bytes, "image/png", "qidi-studio-" + captured_view);
     });
 }
 
@@ -870,7 +1372,7 @@ json capture_printer_camera(QDSDeviceManager* manager, const json& args)
                              {"device_id", device_id}, {"printer_name", device->m_name},
                              {"light_was_on", light_was_on}, {"light_command_sent", true},
                              {"light_left_on", true}, {"light_warmup_ms", warmup_ms}},
-                            body, mime_type);
+                            body, mime_type, "qidi-printer-camera");
 }
 
 json set_printer_case_light(QDSDeviceManager* manager, const json& args)
@@ -4989,7 +5491,7 @@ json export_gcode(const json& args)
 json get_suite_capabilities()
 {
     return {
-        {"suite_version", "1.10.0"},
+        {"suite_version", "1.11.0"},
         {"qidi_target", "2.7.2.10"},
         {"capability_tiers", {
             {"native", json::array({
@@ -6614,6 +7116,17 @@ json tool_definition(const char* name, const char* description, json properties 
             {"outputSchema", {{"type", "object"}}}};
 }
 
+json capture_viewer_tool(json tool)
+{
+    tool["_meta"] = {
+        {"ui", {{"resourceUri", CAPTURE_VIEWER_URI}}},
+        {"openai/outputTemplate", CAPTURE_VIEWER_URI},
+        {"openai/toolInvocation/invoking", "Capturing image..."},
+        {"openai/toolInvocation/invoked", "Capture ready"}
+    };
+    return tool;
+}
+
 json tools_list()
 {
     const json integer_id = {{"type", "integer"}, {"minimum", 0}};
@@ -6667,10 +7180,11 @@ json tools_list()
         {"action"}));
     tools.push_back(tool_definition("get_ui_state",
         "Report QIDI Studio's selected view, visible dialogs, modal blocking state, and project-recovery state."));
-    tools.push_back(tool_definition("capture_studio_screenshot",
-        "Return a PNG image of the visible QIDI Studio window. Optionally switch to Prepare or Preview; target=current can capture a visible modal dialog.",
+    tools.push_back(capture_viewer_tool(tool_definition("capture_studio_screenshot",
+        "Return a PNG image for the QIDI Studio capture viewer plus short-lived local download coordinates. Display the returned image inline. If the client does not render MCP Apps, materialize the image content as a temporary PNG attachment and embed it in the response; do not claim it is displayed unless it is visibly attached. On Windows, background=true temporarily restores a minimized or hidden window outside the visible desktop without activation, captures it, composites the OpenGL build-plate canvas, and restores its prior tab and window state. The local download fallback is download.scheme + '://' + download.origin + download.path.",
         {{"target", {{"type", "string"}, {"enum", json::array({"current", "prepare", "preview"})},
-                     {"default", "current"}}}}));
+                     {"default", "current"}}},
+         {"background", {{"type", "boolean"}, {"default", true}}}})));
     tools.push_back(tool_definition("get_plate_state",
         "Return the active build plate and every object instance transform."));
     tools.push_back(tool_definition("get_print_object_sequence",
@@ -7080,22 +7594,22 @@ json tools_list()
     tools.push_back(tool_definition("get_printer_details",
         "Return detailed physical-printer status including nozzle report, temperatures, fans, explicitly labeled QIDI Box slots 0-15 and external slot 16, the currently loaded physical slot, and camera metadata.",
         {{"device_id", {{"type", "string"}, {"minLength", 1}}}}, {"device_id"}));
-    tools.push_back(tool_definition("capture_printer_camera",
-        "Turn on the printer case light when needed, wait for exposure, and return the current camera image as MCP image content. The light is left on.",
+    tools.push_back(capture_viewer_tool(tool_definition("capture_printer_camera",
+        "Turn on the printer case light when needed, wait for exposure, and return the current camera image in the QIDI capture viewer with a short-lived local download fallback. Display the image inline; if MCP Apps are unavailable, materialize the image content as a temporary image attachment. The light is left on.",
         {{"device_id", {{"type", "string"}, {"minLength", 1}}},
          {"light_warmup_ms", {{"type", "integer"}, {"minimum", 0}, {"maximum", 5000}, {"default", 1200}}}},
-        {"device_id"}));
+        {"device_id"})));
     tools.push_back(tool_definition("set_printer_case_light",
         "Request the printer case light on or off and report whether device telemetry confirms the requested state.",
         {{"device_id", {{"type", "string"}, {"minLength", 1}}},
          {"on", {{"type", "boolean"}}},
          {"confirm_wait_ms", {{"type", "integer"}, {"minimum", 0}, {"maximum", 5000}, {"default", 750}}}},
         {"device_id", "on"}));
-    tools.push_back(tool_definition("capture_print_monitor_snapshot",
-        "Return one camera frame with matching print state, progress, layers, temperatures, fans, and light telemetry. Observational only; it never pauses or cancels a print.",
+    tools.push_back(capture_viewer_tool(tool_definition("capture_print_monitor_snapshot",
+        "Return one camera frame in the QIDI capture viewer with matching print state, progress, layers, temperatures, fans, and light telemetry. Display the frame inline; if MCP Apps are unavailable, materialize the image content as a temporary image attachment. Observational only; it never pauses or cancels a print.",
         {{"device_id", {{"type", "string"}, {"minLength", 1}}},
          {"light_warmup_ms", {{"type", "integer"}, {"minimum", 0}, {"maximum", 5000}, {"default", 1200}}}},
-        {"device_id"}));
+        {"device_id"})));
     tools.push_back(tool_definition("check_printer_readiness",
         "Check observable online/busy state and list physical readiness items the MCP cannot verify.",
         {{"device_id", {{"type", "string"}, {"minLength", 1}}}}, {"device_id"}));
@@ -7150,8 +7664,11 @@ json handle_rpc(QDSDeviceManager* manager, const json& request)
             {"id", id},
             {"result", {
                 {"protocolVersion", "2025-06-18"},
-                {"capabilities", {{"tools", {{"listChanged", false}}}}},
-                {"serverInfo", {{"name", "qidi-studio"}, {"version", "1.10.0"}}}
+                {"capabilities", {
+                    {"tools", {{"listChanged", false}}},
+                    {"resources", {{"subscribe", false}, {"listChanged", false}}}
+                }},
+                {"serverInfo", {{"name", "qidi-studio"}, {"version", "1.11.0"}}}
             }}
         };
     }
@@ -7159,6 +7676,43 @@ json handle_rpc(QDSDeviceManager* manager, const json& request)
         return {{"jsonrpc", "2.0"}, {"id", id}, {"result", json::object()}};
     if (method == "tools/list")
         return {{"jsonrpc", "2.0"}, {"id", id}, {"result", tools_list()}};
+    if (method == "resources/list") {
+        return {
+            {"jsonrpc", "2.0"},
+            {"id", id},
+            {"result", {{"resources", json::array({{
+                {"uri", CAPTURE_VIEWER_URI},
+                {"name", "QIDI Studio Capture Viewer"},
+                {"description", "Displays QIDI Studio and printer-camera captures inside an MCP Apps host."},
+                {"mimeType", "text/html;profile=mcp-app"}
+            }})}}}
+        };
+    }
+    if (method == "resources/read") {
+        const json params = request.value("params", json::object());
+        if (!params.is_object() || params.value("uri", "") != CAPTURE_VIEWER_URI)
+            return rpc_error(id, -32602, "Unknown resource URI");
+        return {
+            {"jsonrpc", "2.0"},
+            {"id", id},
+            {"result", {{"contents", json::array({{
+                {"uri", CAPTURE_VIEWER_URI},
+                {"mimeType", "text/html;profile=mcp-app"},
+                {"text", capture_viewer_html()},
+                {"_meta", {
+                    {"ui", {
+                        {"prefersBorder", true},
+                        {"domain", "https://sslinkyy.github.io"},
+                        {"csp", {
+                            {"connectDomains", json::array()},
+                            {"resourceDomains", json::array()}
+                        }}
+                    }},
+                    {"openai/widgetDescription", "Displays the image returned by a QIDI Studio capture tool."}
+                }}
+            }})}}}
+        };
+    }
     if (method == "tools/call") {
         const json params = request.value("params", json::object());
 
@@ -7464,6 +8018,14 @@ struct QidiMcpServer::Impl
         }
         if (request.method == "OPTIONS") {
             write_http_response(socket, 204, "");
+            return;
+        }
+        if (request.method == "GET" && request.target.rfind("/captures/", 0) == 0) {
+            DownloadableCapture capture;
+            if (!find_capture_download(request.target, capture))
+                write_http_response(socket, 404, "{\"error\":\"capture not found or expired\"}");
+            else
+                write_capture_download(socket, capture);
             return;
         }
         if (request.target != "/mcp") {
