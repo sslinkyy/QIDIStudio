@@ -1,5 +1,15 @@
 # QIDI Studio MCP Changelog
 
+## v1.11.0
+
+- Status: background-capture source patch prepared; Windows x64 build and live acceptance pending. Tool count: 118.
+- Extended `capture_studio_screenshot` with an optional `background` flag that defaults to true while preserving the existing tool name and target values.
+- On Windows, a minimized or hidden QIDI Studio window is restored outside the virtual desktop with no activation, captured with `PrintWindow`, and returned to its original placement, visibility, minimized state, and selected tab.
+- Added sampled dynamic-range validation so an entirely blank background render fails explicitly instead of being returned as a successful image.
+- Kept the existing visible-window capture path available with `background: false`.
+- This first acceptance increment determines whether QIDI's OpenGL Prepare and Preview canvases render through `PrintWindow`; a failed or incomplete canvas will be replaced with native framebuffer rendering before v1.11.0 release.
+- Updated MCP `serverInfo.version` and `get_suite_capabilities().suite_version` to `1.11.0`.
+
 ## v1.10.0
 
 - Status: Windows x64 build and live end-to-end acceptance passed for attachment import, GUI contention, enum serialization, explicit physical-filament selection, guarded print start, and printer-slot verification. Tool count: 118.

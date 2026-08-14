@@ -670,19 +670,147 @@ json capture_studio_screenshot(const json& args)
     if (target != "current" && target != "prepare" && target != "preview")
         return {{"error", "target must be current, prepare, or preview"}};
 
-    return on_gui_thread([target]() {
+    bool background = true;
+    if (args.contains("background")) {
+        if (!args["background"].is_boolean())
+            return {{"error", "background must be a boolean"}};
+        background = args["background"].get<bool>();
+    }
+
+    return on_gui_thread([target, background]() {
         MainFrame* frame = wxGetApp().mainframe;
         if (frame == nullptr || frame->m_tabpanel == nullptr)
             throw std::runtime_error("QIDI Studio main window is not available");
+
+        const int original_tab = frame->m_tabpanel->GetSelection();
+#ifdef __WXMSW__
+        const HWND hwnd = reinterpret_cast<HWND>(frame->GetHandle());
+        if (hwnd == nullptr)
+            throw std::runtime_error("Could not access the QIDI Studio window");
+
+        struct CaptureRestoreGuard
+        {
+            MainFrame* frame{nullptr};
+            HWND hwnd{nullptr};
+            int selected_tab{-1};
+            WINDOWPLACEMENT placement{};
+            bool placement_valid{false};
+            bool was_visible{false};
+            bool was_iconized{false};
+            bool relocated{false};
+            bool restored{false};
+            bool tab_restore_succeeded{true};
+            bool placement_restore_succeeded{true};
+
+            CaptureRestoreGuard(MainFrame* value, HWND handle, int tab)
+                : frame(value), hwnd(handle), selected_tab(tab)
+            {
+                placement.length = sizeof(placement);
+                placement_valid = ::GetWindowPlacement(hwnd, &placement) != FALSE;
+                was_visible = ::IsWindowVisible(hwnd) != FALSE;
+                was_iconized = ::IsIconic(hwnd) != FALSE;
+            }
+
+            bool show_offscreen()
+            {
+                if (!placement_valid)
+                    throw std::runtime_error("Could not save the QIDI Studio window placement");
+
+                RECT normal = placement.rcNormalPosition;
+                int width = normal.right - normal.left;
+                int height = normal.bottom - normal.top;
+                if (width <= 0 || height <= 0) {
+                    RECT current{};
+                    if (::GetWindowRect(hwnd, &current) == FALSE)
+                        throw std::runtime_error("Could not determine the QIDI Studio window size");
+                    width = current.right - current.left;
+                    height = current.bottom - current.top;
+                }
+                if (width <= 0 || height <= 0)
+                    throw std::runtime_error("QIDI Studio main window has no capturable area");
+
+                const int offscreen_x = ::GetSystemMetrics(SM_XVIRTUALSCREEN) +
+                                        ::GetSystemMetrics(SM_CXVIRTUALSCREEN) + 64;
+                const int offscreen_y = ::GetSystemMetrics(SM_YVIRTUALSCREEN) + 64;
+
+                WINDOWPLACEMENT capture = placement;
+                capture.flags = 0;
+                capture.showCmd = SW_SHOWNOACTIVATE;
+                capture.rcNormalPosition.left = offscreen_x;
+                capture.rcNormalPosition.top = offscreen_y;
+                capture.rcNormalPosition.right = offscreen_x + width;
+                capture.rcNormalPosition.bottom = offscreen_y + height;
+
+                relocated = true;
+                if (::SetWindowPlacement(hwnd, &capture) == FALSE)
+                    throw std::runtime_error("Could not prepare the QIDI Studio window for background capture");
+                if (::SetWindowPos(hwnd, HWND_BOTTOM, offscreen_x, offscreen_y, width, height,
+                                   SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW) == FALSE)
+                    throw std::runtime_error("Could not show the QIDI Studio window off-screen");
+                return true;
+            }
+
+            void restore() noexcept
+            {
+                if (restored)
+                    return;
+                restored = true;
+
+                try {
+                    if (frame != nullptr && frame->m_tabpanel != nullptr &&
+                        selected_tab >= 0 && frame->m_tabpanel->GetSelection() != selected_tab) {
+                        frame->select_tab(static_cast<size_t>(selected_tab));
+                        frame->Layout();
+                        frame->Update();
+                        wxYieldIfNeeded();
+                    }
+                } catch (...) {
+                    tab_restore_succeeded = false;
+                }
+                if (frame != nullptr && frame->m_tabpanel != nullptr && selected_tab >= 0)
+                    tab_restore_succeeded = tab_restore_succeeded &&
+                        frame->m_tabpanel->GetSelection() == selected_tab;
+
+                if (relocated && placement_valid && hwnd != nullptr) {
+                    placement_restore_succeeded =
+                        ::SetWindowPlacement(hwnd, &placement) != FALSE;
+                    if (!was_visible)
+                        ::ShowWindow(hwnd, SW_HIDE);
+                    placement_restore_succeeded = placement_restore_succeeded &&
+                        ((::IsWindowVisible(hwnd) != FALSE) == was_visible) &&
+                        (!was_iconized || ::IsIconic(hwnd) != FALSE);
+                }
+            }
+
+            ~CaptureRestoreGuard()
+            {
+                restore();
+            }
+        };
+
+        CaptureRestoreGuard restore_guard(frame, hwnd, original_tab);
+        if (!background && restore_guard.was_iconized)
+            throw std::runtime_error("Restore the QIDI Studio window before taking a screenshot");
+        const bool captured_offscreen = background &&
+            (restore_guard.was_iconized || !restore_guard.was_visible) &&
+            restore_guard.show_offscreen();
+#else
         if (frame->IsIconized())
             throw std::runtime_error("Restore the QIDI Studio window before taking a screenshot");
+        const bool captured_offscreen = false;
+#endif
 
         if (target != "current") {
             require_plater();
             frame->select_tab(static_cast<size_t>(target == "prepare" ? MainFrame::tp3DEditor
                                                                        : MainFrame::tpPreview));
         }
+#ifdef __WXMSW__
+        if (!background)
+            frame->Show(true);
+#else
         frame->Show(true);
+#endif
         frame->Layout();
         frame->Update();
         wxYieldIfNeeded();
@@ -693,9 +821,6 @@ json capture_studio_screenshot(const json& args)
         wxImage image;
         std::string capture_method;
 #ifdef __WXMSW__
-        const HWND hwnd = reinterpret_cast<HWND>(frame->GetHandle());
-        if (hwnd == nullptr)
-            throw std::runtime_error("Could not access the QIDI Studio window");
         HDC reference_dc = ::GetDC(hwnd);
         if (reference_dc == nullptr)
             throw std::runtime_error("Could not access the QIDI Studio window");
@@ -740,7 +865,8 @@ json capture_studio_screenshot(const json& args)
 
         if (!captured || !image.IsOk())
             throw std::runtime_error("Windows could not render the QIDI Studio window for capture");
-        capture_method = "windows_print_window";
+        capture_method = captured_offscreen ? "windows_print_window_offscreen"
+                                            : "windows_print_window";
 #else
         wxBitmap bitmap(rect.width, rect.height, 24);
         if (!bitmap.IsOk())
@@ -757,8 +883,26 @@ json capture_studio_screenshot(const json& args)
         capture_method = "screen_pixels";
 #endif
 
+        if (!image.IsOk() || image.GetData() == nullptr)
+            throw std::runtime_error("QIDI Studio returned an invalid screenshot");
+        unsigned char minimum_channel = 255;
+        unsigned char maximum_channel = 0;
+        const unsigned char* image_data = image.GetData();
+        const std::size_t channel_count =
+            static_cast<std::size_t>(image.GetWidth()) * image.GetHeight() * 3;
+        const std::size_t sample_stride = std::max<std::size_t>(3, channel_count / 12000);
+        for (std::size_t offset = 0; offset < channel_count; offset += sample_stride) {
+            minimum_channel = std::min(minimum_channel, image_data[offset]);
+            maximum_channel = std::max(maximum_channel, image_data[offset]);
+        }
+        const int sampled_dynamic_range =
+            static_cast<int>(maximum_channel) - static_cast<int>(minimum_channel);
+        if (sampled_dynamic_range < 4)
+            throw std::runtime_error(
+                "QIDI Studio returned a blank background capture; off-screen OpenGL rendering is required");
+
         wxMemoryOutputStream stream;
-        if (!image.IsOk() || !image.SaveFile(stream, wxBITMAP_TYPE_PNG))
+        if (!image.SaveFile(stream, wxBITMAP_TYPE_PNG))
             throw std::runtime_error("Could not encode the QIDI Studio screenshot");
         if (stream.GetSize() == 0 || stream.GetSize() > MAX_IMAGE_BYTES)
             throw std::runtime_error("QIDI Studio screenshot exceeds the 8 MiB MCP image limit");
@@ -767,13 +911,48 @@ json capture_studio_screenshot(const json& args)
         const int selected_tab = frame->m_tabpanel->GetSelection();
         const std::string captured_view = selected_tab == MainFrame::tp3DEditor ? "prepare" :
                                           selected_tab == MainFrame::tpPreview ? "preview" : "other";
+
+#ifdef __WXMSW__
+        const bool window_was_visible = restore_guard.was_visible;
+        const bool window_was_iconized = restore_guard.was_iconized;
+        restore_guard.restore();
+        const bool state_restored = restore_guard.placement_restore_succeeded;
+        const bool selected_tab_restored = restore_guard.tab_restore_succeeded;
+#else
+        bool selected_tab_restored = true;
+        if (original_tab >= 0 && frame->m_tabpanel->GetSelection() != original_tab) {
+            try {
+                frame->select_tab(static_cast<size_t>(original_tab));
+                frame->Layout();
+                frame->Update();
+                wxYieldIfNeeded();
+            } catch (...) {
+                selected_tab_restored = false;
+            }
+        }
+        selected_tab_restored = selected_tab_restored &&
+            (original_tab < 0 || frame->m_tabpanel->GetSelection() == original_tab);
+        const bool state_restored = true;
+        const bool window_was_visible = frame->IsShown();
+        const bool window_was_iconized = false;
+#endif
+
         return attach_mcp_image({{"captured", true}, {"source", "qidi_studio_window"},
                                  {"view", captured_view}, {"width", rect.width}, {"height", rect.height},
+                                 {"background_requested", background},
+                                 {"captured_offscreen", captured_offscreen},
+                                 {"window_was_visible", window_was_visible},
+                                 {"window_was_iconized", window_was_iconized},
+                                 {"window_state_restored", state_restored},
+                                 {"selected_tab_restored", selected_tab_restored},
+                                 {"sampled_dynamic_range", sampled_dynamic_range},
                                  {"screen_capture", capture_method == "screen_pixels"},
                                  {"capture_method", capture_method},
-                                 {"note", capture_method == "windows_print_window"
-                                     ? "Captured directly from the QIDI Studio window; overlapping windows are excluded."
-                                     : "The capture contains visible screen pixels; overlapping windows may appear."}},
+                                 {"note", capture_method == "screen_pixels"
+                                     ? "The capture contains visible screen pixels; overlapping windows may appear."
+                                     : captured_offscreen
+                                         ? "QIDI Studio was rendered outside the visible desktop without activation and its prior window state was restored."
+                                         : "Captured directly from the QIDI Studio window; overlapping windows are excluded."}},
                                 bytes, "image/png");
     });
 }
@@ -4989,7 +5168,7 @@ json export_gcode(const json& args)
 json get_suite_capabilities()
 {
     return {
-        {"suite_version", "1.10.0"},
+        {"suite_version", "1.11.0"},
         {"qidi_target", "2.7.2.10"},
         {"capability_tiers", {
             {"native", json::array({
@@ -6668,9 +6847,10 @@ json tools_list()
     tools.push_back(tool_definition("get_ui_state",
         "Report QIDI Studio's selected view, visible dialogs, modal blocking state, and project-recovery state."));
     tools.push_back(tool_definition("capture_studio_screenshot",
-        "Return a PNG image of the visible QIDI Studio window. Optionally switch to Prepare or Preview; target=current can capture a visible modal dialog.",
+        "Return a PNG image of the QIDI Studio window. On Windows, background=true temporarily restores a minimized or hidden window outside the visible desktop without activation, captures it, and restores its prior tab and window state.",
         {{"target", {{"type", "string"}, {"enum", json::array({"current", "prepare", "preview"})},
-                     {"default", "current"}}}}));
+                     {"default", "current"}}},
+         {"background", {{"type", "boolean"}, {"default", true}}}}));
     tools.push_back(tool_definition("get_plate_state",
         "Return the active build plate and every object instance transform."));
     tools.push_back(tool_definition("get_print_object_sequence",
@@ -7151,7 +7331,7 @@ json handle_rpc(QDSDeviceManager* manager, const json& request)
             {"result", {
                 {"protocolVersion", "2025-06-18"},
                 {"capabilities", {{"tools", {{"listChanged", false}}}}},
-                {"serverInfo", {{"name", "qidi-studio"}, {"version", "1.10.0"}}}
+                {"serverInfo", {{"name", "qidi-studio"}, {"version", "1.11.0"}}}
             }}
         };
     }
