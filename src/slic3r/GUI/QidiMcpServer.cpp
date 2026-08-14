@@ -84,7 +84,7 @@ constexpr auto PRINT_TOKEN_DEFAULT_TTL = std::chrono::seconds(600);
 constexpr auto PRINT_TOKEN_MAX_TTL = std::chrono::seconds(1800);
 constexpr auto CAPTURE_DOWNLOAD_TTL = std::chrono::minutes(10);
 constexpr std::size_t MAX_CAPTURE_DOWNLOADS = 8;
-constexpr const char* CAPTURE_VIEWER_URI = "ui://qidi-studio/capture-viewer-v2.html";
+constexpr const char* CAPTURE_VIEWER_URI = "ui://qidi-studio/capture-viewer-v3.html";
 
 const char* capture_viewer_html()
 {
@@ -7700,7 +7700,14 @@ json handle_rpc(QDSDeviceManager* manager, const json& request)
                 {"mimeType", "text/html;profile=mcp-app"},
                 {"text", capture_viewer_html()},
                 {"_meta", {
-                    {"ui", {{"prefersBorder", true}}},
+                    {"ui", {
+                        {"prefersBorder", true},
+                        {"domain", "https://sslinkyy.github.io"},
+                        {"csp", {
+                            {"connectDomains", json::array()},
+                            {"resourceDomains", json::array()}
+                        }}
+                    }},
                     {"openai/widgetDescription", "Displays the image returned by a QIDI Studio capture tool."}
                 }}
             }})}}}
