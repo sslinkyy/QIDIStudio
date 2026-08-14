@@ -84,7 +84,7 @@ constexpr auto PRINT_TOKEN_DEFAULT_TTL = std::chrono::seconds(600);
 constexpr auto PRINT_TOKEN_MAX_TTL = std::chrono::seconds(1800);
 constexpr auto CAPTURE_DOWNLOAD_TTL = std::chrono::minutes(10);
 constexpr std::size_t MAX_CAPTURE_DOWNLOADS = 8;
-constexpr const char* CAPTURE_VIEWER_URI = "ui://qidi-studio/capture-viewer-v1.html";
+constexpr const char* CAPTURE_VIEWER_URI = "ui://qidi-studio/capture-viewer-v2.html";
 
 const char* capture_viewer_html()
 {
@@ -132,6 +132,16 @@ const char* capture_viewer_html()
   const meta = document.getElementById("meta");
   const download = document.getElementById("download");
 
+  function normalizeToolResult(value) {
+    if (!value || typeof value !== "object") return null;
+    if (Array.isArray(value.content) || value.structuredContent) return value;
+    for (const key of ["mcp_tool_result", "call_tool_result", "result"]) {
+      const nested = normalizeToolResult(value[key]);
+      if (nested) return nested;
+    }
+    return null;
+  }
+
   function render(result) {
     const blocks = Array.isArray(result && result.content) ? result.content : [];
     const image = blocks.find(block => block && block.type === "image" && typeof block.data === "string");
@@ -164,9 +174,16 @@ const char* capture_viewer_html()
   window.addEventListener("message", event => {
     if (event.source !== window.parent) return;
     const message = event.data;
-    if (message && message.jsonrpc === "2.0" && message.method === "ui/notifications/tool-result")
-      render(message.params || {});
+    if (message && message.jsonrpc === "2.0" && message.method === "ui/notifications/tool-result") {
+      const result = normalizeToolResult(message.params);
+      if (result) render(result);
+    }
   });
+
+  const openai = typeof window !== "undefined" ? window.openai : undefined;
+  const initialResult = normalizeToolResult(openai && openai.toolResponseMetadata)
+    || (openai && openai.toolOutput ? { structuredContent: openai.toolOutput } : null);
+  if (initialResult) render(initialResult);
 })();
 </script>
 </body>
@@ -7164,7 +7181,7 @@ json tools_list()
     tools.push_back(tool_definition("get_ui_state",
         "Report QIDI Studio's selected view, visible dialogs, modal blocking state, and project-recovery state."));
     tools.push_back(capture_viewer_tool(tool_definition("capture_studio_screenshot",
-        "Return a PNG image for the QIDI Studio capture viewer plus short-lived local download coordinates. On Windows, background=true temporarily restores a minimized or hidden window outside the visible desktop without activation, captures it, composites the OpenGL build-plate canvas, and restores its prior tab and window state. The local download fallback is download.scheme + '://' + download.origin + download.path.",
+        "Return a PNG image for the QIDI Studio capture viewer plus short-lived local download coordinates. Display the returned image inline. If the client does not render MCP Apps, materialize the image content as a temporary PNG attachment and embed it in the response; do not claim it is displayed unless it is visibly attached. On Windows, background=true temporarily restores a minimized or hidden window outside the visible desktop without activation, captures it, composites the OpenGL build-plate canvas, and restores its prior tab and window state. The local download fallback is download.scheme + '://' + download.origin + download.path.",
         {{"target", {{"type", "string"}, {"enum", json::array({"current", "prepare", "preview"})},
                      {"default", "current"}}},
          {"background", {{"type", "boolean"}, {"default", true}}}})));
@@ -7578,7 +7595,7 @@ json tools_list()
         "Return detailed physical-printer status including nozzle report, temperatures, fans, explicitly labeled QIDI Box slots 0-15 and external slot 16, the currently loaded physical slot, and camera metadata.",
         {{"device_id", {{"type", "string"}, {"minLength", 1}}}}, {"device_id"}));
     tools.push_back(capture_viewer_tool(tool_definition("capture_printer_camera",
-        "Turn on the printer case light when needed, wait for exposure, and return the current camera image in the QIDI capture viewer with a short-lived local download fallback. The light is left on.",
+        "Turn on the printer case light when needed, wait for exposure, and return the current camera image in the QIDI capture viewer with a short-lived local download fallback. Display the image inline; if MCP Apps are unavailable, materialize the image content as a temporary image attachment. The light is left on.",
         {{"device_id", {{"type", "string"}, {"minLength", 1}}},
          {"light_warmup_ms", {{"type", "integer"}, {"minimum", 0}, {"maximum", 5000}, {"default", 1200}}}},
         {"device_id"})));
@@ -7589,7 +7606,7 @@ json tools_list()
          {"confirm_wait_ms", {{"type", "integer"}, {"minimum", 0}, {"maximum", 5000}, {"default", 750}}}},
         {"device_id", "on"}));
     tools.push_back(capture_viewer_tool(tool_definition("capture_print_monitor_snapshot",
-        "Return one camera frame in the QIDI capture viewer with matching print state, progress, layers, temperatures, fans, and light telemetry. Observational only; it never pauses or cancels a print.",
+        "Return one camera frame in the QIDI capture viewer with matching print state, progress, layers, temperatures, fans, and light telemetry. Display the frame inline; if MCP Apps are unavailable, materialize the image content as a temporary image attachment. Observational only; it never pauses or cancels a print.",
         {{"device_id", {{"type", "string"}, {"minLength", 1}}},
          {"light_warmup_ms", {{"type", "integer"}, {"minimum", 0}, {"maximum", 5000}, {"default", 1200}}}},
         {"device_id"})));

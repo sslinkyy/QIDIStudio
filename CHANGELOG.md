@@ -5,6 +5,7 @@
 - Status: background/offscreen capture, OpenGL canvas composition, local download, and large-response transport acceptance passed; MCP App inline-viewer rebuild and live ChatGPT acceptance pending. Tool count: 118.
 - Added an MCP Apps capture viewer resource and linked all three image-producing tools to it so compatible ChatGPT clients can display Studio screenshots and printer-camera frames directly in the conversation, including a responsive image view and download control.
 - Kept image bytes inside the authenticated MCP tool result and retained loopback download URLs only as a local fallback; no capture endpoint is exposed through the external tunnel.
+- Hydrated the viewer from ChatGPT's full tool-response metadata when the initial result notification arrives before component subscription, versioned the resource URI to invalidate cached viewer HTML, and directed non-MCP-Apps clients to materialize the returned image content as an inline temporary attachment instead of merely reporting capture success.
 - Extended `capture_studio_screenshot` with an optional `background` flag that defaults to true while preserving the existing tool name and target values.
 - On Windows, a minimized or hidden QIDI Studio window is restored outside the virtual desktop with no activation, captured with `PrintWindow`, and returned to its original placement, visibility, minimized state, and selected tab.
 - Added sampled dynamic-range validation so an entirely blank background render fails explicitly instead of being returned as a successful image.
